@@ -98,10 +98,18 @@ function detectScreenType(text) {
 
   // Check last few lines for UI state (avoids matching response text)
   const lines = text.split('\n');
-  const tail = lines.slice(-15).join('\n');
   const nonEmptyLines = lines.filter(l => l.trim());
+  const tail = nonEmptyLines.slice(-15).join('\n');
 
-  // Idle: prompt waiting for input — check FIRST to avoid false processing matches
+  const activeProcessing =
+    /(^|\n)\s*[✻●⏺◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*\w+ing\b/m.test(tail) ||
+    (/esc to interrupt/i.test(tail) && /(^|\n)\s*[✻●⏺◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/m.test(tail));
+
+  if (activeProcessing) {
+    return 'processing';
+  }
+
+  // Idle: prompt waiting for input
   // Claude Code idle screen has: ❯ (prompt line) + separator + bypass hint
   for (let i = nonEmptyLines.length - 1; i >= Math.max(0, nonEmptyLines.length - 6); i--) {
     if (/^❯\s*$/.test(nonEmptyLines[i].trim())) {
@@ -122,10 +130,7 @@ function detectScreenType(text) {
   }
 
   // Processing: Claude is actively working — only match UI indicators in tail
-  if (
-    /[✻●⏺◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*\w+ing\b/.test(tail) ||
-    (/esc to interrupt/i.test(tail) && /[✻●⏺◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(tail))
-  ) {
+  if (activeProcessing) {
     return 'processing';
   }
 
