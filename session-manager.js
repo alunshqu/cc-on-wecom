@@ -2,11 +2,16 @@ const fs = require('fs');
 const path = require('path');
 const pty = require('node-pty');
 const { Terminal } = require('@xterm/headless');
+const durableState = require('./durable-state');
 
 const COLS = 120, ROWS = 200;
 const SCROLLBACK = 5000;
 const LOG_FILE = '/tmp/happyweb-debug.log';
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
+const CONTEXT_COMPACT_THRESHOLD = parseFloat(process.env.CONTEXT_COMPACT_THRESHOLD || '0.85');
+const CONTEXT_CHECK_EVERY_TURNS = parseInt(process.env.CONTEXT_CHECK_EVERY_TURNS || '6', 10);
+const CONTEXT_CHECK_STALE_MS = parseInt(process.env.CONTEXT_CHECK_STALE_MS || '600000', 10);
+const CONTEXT_COMPACT_COOLDOWN_MS = parseInt(process.env.CONTEXT_COMPACT_COOLDOWN_MS || '300000', 10);
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 // Clear log on start
@@ -19,12 +24,25 @@ function log(id, msg) {
 
 const sessions = new Map();
 
-function createSession(id, cwd) {
+function createSession(id, cwd, restored = {}) {
+  const claude = restored.claude || {};
   const s = {
     id, ptyProc: null,
     vt: new Terminal({ cols: COLS, rows: ROWS, scrollback: SCROLLBACK, allowProposedApi: true }),
-    clients: new Set(), status: 'starting', history: [],
-    cwd: cwd || process.env.HOME, created: Date.now(),
+    clients: new Set(), status: 'starting',
+    history: Array.isArray(restored.history) ? restored.history : [],
+    cwd: restored.cwd || cwd || process.env.HOME,
+    created: restored.created || Date.now(),
+    durable: restored.durable !== false,
+    claudeSessionId: claude.sessionId || restored.claudeSessionId || null,
+    resumeFailureCount: claude.resumeFailureCount || 0,
+    lastResumeAttemptAt: claude.lastResumeAttemptAt || null,
+    lastResumeSucceededAt: claude.lastResumeSucceededAt || null,
+    context: restored.context || {},
+    restore: {
+      ...(restored.restore || {}),
+      needsHistorySeed: Boolean((restored.restore || {}).needsHistorySeed || (restored.history?.length && !(claude.sessionId || restored.claudeSessionId))),
+    },
     phase: 'init',
     sentTrustEnter: false,
     userMsgSentAt: 0,
@@ -41,11 +59,54 @@ function createSession(id, cwd) {
     lastActivityAt: Date.now(),
     heartbeatTimer: null,
     lastExtractedResponse: null,
-    // For external callers (wecom.js) waiting on response
     pendingCallbacks: [],
+    currentRequest: null,
+    _messageQueue: [],
+    _maintenanceQueued: null,
+    _lastSpawnUsedResume: false,
+    _spawnedFreshAfterResumeFailure: false,
   };
   sessions.set(id, s);
+  saveSessionState(s);
   return s;
+}
+
+function saveSessionState(session) {
+  if (!session || session.durable === false) return;
+  durableState.saveSession(session);
+}
+
+function restorePersistedSessions({ start = true } = {}) {
+  const restored = [];
+  for (const state of durableState.loadAllSessions()) {
+    if (!state.id || sessions.has(state.id)) continue;
+    const session = createSession(state.id, state.cwd, state);
+    restored.push(session);
+    if (start) startClaude(session);
+  }
+  if (restored.length) log('server', `Restored ${restored.length} persisted sessions`);
+  return restored;
+}
+
+function destroySession(id, { deleteState = true } = {}) {
+  const session = sessions.get(id);
+  if (!session) {
+    if (deleteState) durableState.deleteSessionState(id);
+    return false;
+  }
+  session._destroyed = true;
+  if (session.ptyProc) {
+    try { session.ptyProc.kill(); } catch (_) {}
+  }
+  stopPolling(session);
+  if (session.sentMsgTimeout) clearTimeout(session.sentMsgTimeout);
+  if (session.sentMsgAbsoluteTimeout) clearTimeout(session.sentMsgAbsoluteTimeout);
+  if (session.doneTimer) clearTimeout(session.doneTimer);
+  if (session._processingWatchdog) clearInterval(session._processingWatchdog);
+  session.clients.clear();
+  sessions.delete(id);
+  if (deleteState) durableState.deleteSessionState(id);
+  return true;
 }
 
 function broadcast(session, msg) {
@@ -91,15 +152,21 @@ function detectScreenType(text) {
     return 'trust_prompt';
   }
 
+  const lines = text.split('\n');
+  const nonEmptyLines = lines.filter(l => l.trim());
+  const tail = nonEmptyLines.slice(-15).join('\n');
+
+  if (/←.*Submit.*→/.test(tail) || /\b✔\s*Submit\b/.test(tail) ||
+      (/^❯\s*\d+[.)、]/m.test(tail) && /[？?]|用什么|选择|输入|是否|确认|允许|可见性|仓库名/.test(tail))) {
+    return 'interactive_prompt';
+  }
+
   // Permission prompt (waiting for user approval)
   if (/Allow|Deny|allow once|allow always/i.test(text) && /\(y\/n\)|Yes.*No/i.test(text)) {
     return 'permission_prompt';
   }
 
   // Check last few lines for UI state (avoids matching response text)
-  const lines = text.split('\n');
-  const nonEmptyLines = lines.filter(l => l.trim());
-  const tail = nonEmptyLines.slice(-15).join('\n');
 
   const activeProcessing =
     /(^|\n)\s*[✻●⏺◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*\w+ing\b/m.test(tail) ||
@@ -137,7 +204,19 @@ function detectScreenType(text) {
   return 'unknown';
 }
 
-function extractResponse(vt) {
+function findPromptForRequest(lines, requestText, searchStart) {
+  if (!requestText) return -1;
+  const normalizedRequest = String(requestText).trim();
+  for (let i = searchStart; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line.startsWith('❯')) continue;
+    const promptText = line.replace(/^❯\s*/, '').trim();
+    if (promptText === normalizedRequest) return i;
+  }
+  return -1;
+}
+
+function extractResponse(vt, requestText) {
   const lines = getScreenLines(vt);
 
   // Find the LAST empty prompt line (❯ with nothing after it)
@@ -152,7 +231,8 @@ function extractResponse(vt) {
   // Find the last user message prompt (❯ with content after it)
   let userMsgPrompt = -1;
   const searchStart = lastEmptyPrompt !== -1 ? lastEmptyPrompt - 1 : lines.length - 1;
-  for (let i = searchStart; i >= 0; i--) {
+  userMsgPrompt = findPromptForRequest(lines, requestText, searchStart);
+  for (let i = searchStart; userMsgPrompt === -1 && i >= 0; i--) {
     if (/^❯\s+\S/.test(lines[i])) {
       userMsgPrompt = i;
       break;
@@ -172,6 +252,211 @@ function extractResponse(vt) {
   while (result.length && !result[0]) result.shift();
   while (result.length && !result[result.length - 1]) result.pop();
   return result.join('\n').trim() || null;
+}
+
+function extractClaudeSessionId(text) {
+  if (!text) return null;
+  const match = text.match(/\b(?:Session(?:\s+ID)?|sessionId|conversation(?:\s+ID)?)[:"\s]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i);
+  return match ? match[1] : null;
+}
+
+function captureClaudeSessionId(session, text) {
+  const id = extractClaudeSessionId(text);
+  if (!id || id === session.claudeSessionId) return false;
+  session.claudeSessionId = id;
+  session.resumeFailureCount = 0;
+  log(session.id, `Captured Claude session id: ${id}`);
+  saveSessionState(session);
+  return true;
+}
+
+function encodeClaudeProjectPath(cwd) {
+  return String(cwd || process.env.HOME).replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+function discoverClaudeSessionIdFromLocalLogs(session) {
+  if (!session || session.claudeSessionId) return null;
+  const dir = path.join(process.env.HOME || '', '.claude', 'projects', encodeClaudeProjectPath(session.cwd));
+  try {
+    if (!fs.existsSync(dir)) return null;
+    const spawnedAt = session.claudeSpawnedAt || session.created || 0;
+    const candidates = fs.readdirSync(dir)
+      .filter(name => name.endsWith('.jsonl'))
+      .map(name => {
+        const file = path.join(dir, name);
+        const stat = fs.statSync(file);
+        return { file, mtimeMs: stat.mtimeMs };
+      })
+      .filter(item => item.mtimeMs >= spawnedAt - 5000)
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .slice(0, 5);
+
+    const found = [];
+    for (const { file, mtimeMs } of candidates) {
+      const firstChunk = fs.readFileSync(file, 'utf8').split('\n').slice(0, 5).join('\n');
+      if (firstChunk && !firstChunk.includes(`"cwd":"${session.cwd}"`) && !firstChunk.includes(`"cwd": "${session.cwd}"`)) {
+        continue;
+      }
+      const id = extractClaudeSessionId(firstChunk) || path.basename(file, '.jsonl');
+      if (id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+        found.push({ id, mtimeMs });
+      }
+    }
+    const uniqueIds = [...new Set(found.map(item => item.id))];
+    if (uniqueIds.length === 1) {
+      const id = uniqueIds[0];
+      session.claudeSessionId = id;
+      session.resumeFailureCount = 0;
+      log(session.id, `Discovered Claude session id from local logs: ${id}`);
+      saveSessionState(session);
+      return id;
+    }
+    if (uniqueIds.length > 1) log(session.id, `Claude session id discovery ambiguous (${uniqueIds.length} candidates)`);
+  } catch (e) {
+    log(session.id, `Claude session id discovery failed: ${e.message}`);
+  }
+  return null;
+}
+
+function parseTokenCount(value, suffix) {
+  if (!value) return null;
+  const n = parseFloat(String(value).replace(/,/g, ''));
+  if (!Number.isFinite(n)) return null;
+  const unit = String(suffix || '').toLowerCase();
+  if (unit === 'm') return Math.round(n * 1000000);
+  if (unit === 'k') return Math.round(n * 1000);
+  return Math.round(n);
+}
+
+function parseContextUsage(text) {
+  if (!text) return null;
+  let match = text.match(/context[^\n]*?([\d.,]+)\s*([kKmM]?)\s*\/\s*([\d.,]+)\s*([kKmM]?)/i) ||
+    text.match(/([\d.,]+)\s*([kKmM]?)\s*\/\s*([\d.,]+)\s*([kKmM]?)\s*tokens/i);
+  if (match) {
+    const usedTokens = parseTokenCount(match[1], match[2]);
+    const maxTokens = parseTokenCount(match[3], match[4]);
+    if (usedTokens && maxTokens) return { usedTokens, maxTokens, percent: usedTokens / maxTokens };
+  }
+  match = text.match(/context[^\n]*?(\d{1,3})\s*%|(?:^|\s)(\d{1,3})\s*%\s*(?:context|used)/i);
+  if (match) {
+    const percentValue = parseInt(match[1] || match[2], 10);
+    if (Number.isFinite(percentValue)) return { percent: percentValue / 100 };
+  }
+  return null;
+}
+
+function shouldCompact(context) {
+  if (!context || typeof context.percent !== 'number') return false;
+  if (Date.now() - (context.lastCompactedAt || 0) < CONTEXT_COMPACT_COOLDOWN_MS) return false;
+  return context.percent >= CONTEXT_COMPACT_THRESHOLD;
+}
+
+function updateContextUsageFromText(session, text) {
+  const usage = parseContextUsage(text);
+  if (!usage) return false;
+  const previous = session.context || {};
+  const next = {
+    ...previous,
+    ...usage,
+    lastCheckedAt: Date.now(),
+  };
+  next.needsCompact = shouldCompact(next);
+  const changed =
+    previous.usedTokens !== next.usedTokens ||
+    previous.maxTokens !== next.maxTokens ||
+    Math.round((previous.percent || 0) * 1000) !== Math.round((next.percent || 0) * 1000) ||
+    previous.needsCompact !== next.needsCompact;
+  session.context = next;
+  if (changed) {
+    log(session.id, `Context usage updated: ${Math.round((next.percent || 0) * 100)}%`);
+    saveSessionState(session);
+  }
+  return true;
+}
+
+function isContextCheckDue(session) {
+  const context = session.context || {};
+  if (!context.lastCheckedAt) return true;
+  if (Date.now() - context.lastCheckedAt >= CONTEXT_CHECK_STALE_MS) return true;
+  return (context.turnsSinceLastCheck || 0) >= CONTEXT_CHECK_EVERY_TURNS;
+}
+
+function buildHistoryRestorePrompt(session) {
+  const maxMessages = 20;
+  const maxChars = 24000;
+  const selected = [];
+  let used = 0;
+  for (let i = session.history.length - 1; i >= 0 && selected.length < maxMessages; i--) {
+    const entry = session.history[i];
+    const line = `[${entry.role}] ${entry.content}`;
+    const len = line.length + 2;
+    if (used + len > maxChars && selected.length) break;
+    selected.unshift(line);
+    used += len;
+  }
+  return [
+    'This HappyWeb session was restored after a service restart. The original Claude Code conversation could not be resumed, so here is a bounded transcript of recent prior turns. Treat it as conversation context for future replies. Reply with only: Restored.',
+    '',
+    '<transcript>',
+    selected.join('\n\n'),
+    '</transcript>',
+  ].join('\n');
+}
+
+function maybeSeedRestoredHistory(session) {
+  if (!session.restore?.needsHistorySeed) return;
+  if (session.restore.historySeededAt) return;
+  if (!session.history.length) return;
+  session.restore.historySeededAt = Date.now();
+  saveSessionState(session);
+  enqueueInternalCommand(session, buildHistoryRestorePrompt(session), { kind: 'history_seed' });
+}
+
+function maybeScheduleContextMaintenance(session) {
+  if (!session || session.phase !== 'idle' || session._maintenanceQueued) return;
+  if (!session.history?.some(entry => entry.role === 'user')) return;
+  if (session.context?.needsCompact) {
+    enqueueInternalCommand(session, '/compact', { kind: 'compact', priority: true });
+    return;
+  }
+  if (session._messageQueue?.length) return;
+  if (isContextCheckDue(session)) {
+    enqueueInternalCommand(session, '/context', { kind: 'context_check' });
+  }
+}
+
+function markInternalComplete(session, kind, response) {
+  session._maintenanceQueued = null;
+  if (kind === 'context_check') {
+    updateContextUsageFromText(session, response || getScreenText(session.vt));
+    session.context = { ...(session.context || {}), turnsSinceLastCheck: 0, lastCheckedAt: Date.now() };
+  } else if (kind === 'compact') {
+    session.context = {
+      ...(session.context || {}),
+      needsCompact: false,
+      turnsSinceLastCheck: 0,
+      lastCheckedAt: Date.now(),
+      lastCompactedAt: Date.now(),
+    };
+  }
+  saveSessionState(session);
+}
+
+function onSessionReady(session, label) {
+  session.phase = 'idle';
+  session.status = 'idle';
+  session.restartCount = 0;
+  if (session._lastSpawnUsedResume) session.lastResumeSucceededAt = Date.now();
+  discoverClaudeSessionIdFromLocalLogs(session);
+  saveSessionState(session);
+  log(session.id, label);
+  broadcast(session, { type: 'status', status: 'idle', sessionId: session.id });
+  broadcastAll({ type: 'sessions', sessions: sessionList() });
+  maybeSeedRestoredHistory(session);
+  setTimeout(() => {
+    maybeScheduleContextMaintenance(session);
+    _drainQueue(session);
+  }, 1000);
 }
 
 function isNoiseLine(line) {
@@ -231,13 +516,22 @@ function startClaude(session) {
   session.doneTimer = null;
   session.lastExtractedResponse = null;
   session.pendingCallbacks = [];
+  session.currentRequest = null;
+  session.claudeSpawnedAt = Date.now();
 
   const claudePath = process.env.CLAUDE_PATH || '/usr/local/bin/claude';
-  log(session.id, `Spawning Claude CLI from ${claudePath}...`);
+  const args = ['--permission-mode', 'bypassPermissions'];
+  session._lastSpawnUsedResume = Boolean(session.claudeSessionId);
+  if (session.claudeSessionId) {
+    args.push('--resume', session.claudeSessionId);
+    session.lastResumeAttemptAt = Date.now();
+    log(session.id, `Spawning Claude CLI from ${claudePath} with --resume ${session.claudeSessionId}...`);
+  } else {
+    log(session.id, `Spawning Claude CLI from ${claudePath}...`);
+  }
+  saveSessionState(session);
 
-  const proc = pty.spawn(claudePath, [
-    '--permission-mode', 'bypassPermissions',
-  ], {
+  const proc = pty.spawn(claudePath, args, {
     name: 'xterm-256color', cols: COLS, rows: ROWS,
     cwd: session.cwd,
     env: { ...process.env, TERM: 'xterm-256color' },
@@ -248,6 +542,8 @@ function startClaude(session) {
     session.onDataCount++;
     session.lastActivityAt = Date.now();
     session.vt.write(data);
+    captureClaudeSessionId(session, data);
+    updateContextUsageFromText(session, data);
     if (session.onDataCount <= 5 || session.onDataCount % 50 === 0) {
       const screenType = detectScreenType(getScreenText(session.vt));
       log(session.id, `onData #${session.onDataCount}: len=${data.length}, screenType=${screenType}, phase=${session.phase}`);
@@ -257,13 +553,21 @@ function startClaude(session) {
 
   proc.onExit(({ exitCode }) => {
     log(session.id, `Exited code=${exitCode}`);
+    if (session._destroyed || !sessions.has(session.id)) return;
+    const resumeFailed = session._lastSpawnUsedResume && session.phase === 'init' && exitCode !== 0;
     session.ptyProc = null;
     session.status = 'stopped';
     session.phase = 'stopped';
     stopPolling(session);
+    if (resumeFailed) {
+      log(session.id, `Resume failed for ${session.claudeSessionId}; clearing saved Claude session id`);
+      session.claudeSessionId = null;
+      session.resumeFailureCount = (session.resumeFailureCount || 0) + 1;
+      if (session.history.length) session.restore.needsHistorySeed = true;
+      saveSessionState(session);
+    }
     broadcast(session, { type: 'exited', code: exitCode, sessionId: session.id });
     broadcastAll({ type: 'sessions', sessions: sessionList() });
-    // Auto-restart with exponential backoff
     if (!session.restartCount) session.restartCount = 0;
     if (session.restartCount < 3) {
       const delay = Math.min(2000 * Math.pow(2, session.restartCount), 30000);
@@ -273,7 +577,6 @@ function startClaude(session) {
         if (session.phase === 'stopped') startClaude(session);
       }, delay);
     } else {
-      // Don't give up forever — retry every 5 minutes
       log(session.id, `Max quick restarts reached, will retry in 5 minutes`);
       setTimeout(() => {
         if (session.phase === 'stopped') {
@@ -284,10 +587,8 @@ function startClaude(session) {
     }
   });
 
-  // Start polling timer as backup detection
   session.pollTimer = setInterval(() => pollScreen(session), 1000);
 
-  // Start heartbeat — detects alive-but-stuck Claude processes
   if (session.heartbeatTimer) clearInterval(session.heartbeatTimer);
   session.heartbeatTimer = setInterval(() => heartbeatCheck(session), 30000);
   session.lastActivityAt = Date.now();
@@ -365,7 +666,7 @@ function heartbeatCheck(session) {
       log(session.id, `HEARTBEAT: STUCK ${Math.round(inactiveMs/1000)}s, net=${connections}, cpu=${cpu}`);
       diagnoseProcess(session, `stuck_${session.phase}`);
       // Try to extract whatever we have before restarting
-      const response = extractResponse(session.vt);
+      const response = extractResponse(session.vt, session.currentRequest?.text);
       if (response && response !== session.lastExtractedResponse) {
         log(session.id, `HEARTBEAT: salvaging response before restart (${response.length} chars)`);
         finishResponse(session, 'heartbeat_salvage', response);
@@ -460,6 +761,8 @@ function restartClaude(session, reason) {
 function pollScreen(session) {
   if (!session.ptyProc) return;
   const text = getScreenText(session.vt);
+  captureClaudeSessionId(session, text);
+  updateContextUsageFromText(session, text);
   const screenType = detectScreenType(text);
 
   if (screenType !== session.lastDetectedType) {
@@ -472,6 +775,8 @@ function pollScreen(session) {
 
 function processTick(session) {
   const text = getScreenText(session.vt);
+  captureClaudeSessionId(session, text);
+  updateContextUsageFromText(session, text);
   const screenType = detectScreenType(text);
   handleState(session, screenType);
 }
@@ -493,23 +798,13 @@ function handleState(session, screenType) {
 
   // 2. After trust → idle
   if (session.phase === 'waiting_trust' && screenType === 'idle') {
-    session.phase = 'idle';
-    session.status = 'idle';
-    session.restartCount = 0;
-    log(session.id, 'Claude ready!');
-    broadcast(session, { type: 'status', status: 'idle', sessionId: session.id });
-    broadcastAll({ type: 'sessions', sessions: sessionList() });
+    onSessionReady(session, 'Claude ready!');
     return;
   }
 
   // Also handle init → idle directly (no trust prompt needed)
   if (session.phase === 'init' && screenType === 'idle') {
-    session.phase = 'idle';
-    session.status = 'idle';
-    session.restartCount = 0;
-    log(session.id, 'Claude ready (no trust prompt)!');
-    broadcast(session, { type: 'status', status: 'idle', sessionId: session.id });
-    broadcastAll({ type: 'sessions', sessions: sessionList() });
+    onSessionReady(session, 'Claude ready (no trust prompt)!');
     return;
   }
 
@@ -517,6 +812,8 @@ function handleState(session, screenType) {
   if (session.phase === 'sent_msg') {
     if (screenType === 'processing') {
       transitionToProcessing(session);
+    } else if (screenType === 'interactive_prompt') {
+      transitionToInteractivePrompt(session);
     } else if (screenType === 'idle') {
       // Idle right after sending? Claude responded instantly or message wasn't received.
       // Use stability check to confirm it's truly idle.
@@ -538,6 +835,8 @@ function handleState(session, screenType) {
           finishResponse(session, 'sent_msg_failsafe');
         } else if (currentType === 'processing') {
           transitionToProcessing(session);
+        } else if (currentType === 'interactive_prompt') {
+          transitionToInteractivePrompt(session);
         }
         // Otherwise keep waiting — heartbeat will handle truly stuck cases
       }, 20000);
@@ -551,6 +850,8 @@ function handleState(session, screenType) {
       // Still working — reset stability timer
       session.lastActivityAt = Date.now();
       if (session.doneTimer) { clearTimeout(session.doneTimer); session.doneTimer = null; }
+    } else if (screenType === 'interactive_prompt') {
+      transitionToInteractivePrompt(session);
     } else if (screenType === 'idle') {
       // Idle prompt appeared — Claude is done. Short stability check to be sure.
       scheduleStabilityCheck(session, 'processing_to_idle');
@@ -579,12 +880,147 @@ function handleState(session, screenType) {
             clearInterval(session._processingWatchdog);
             session._processingWatchdog = null;
             finishResponse(session, 'watchdog_inactive');
+          } else if (currentType === 'interactive_prompt') {
+            transitionToInteractivePrompt(session);
           }
         }
       }, 5000);
     }
     return;
   }
+}
+
+function cleanInteractiveLine(line) {
+  return String(line || '')
+    .replace(/[╭╰╮╯│─━╌┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parseInteractiveState(vt) {
+  const rawLines = getScreenLines(vt).filter(l => l.trim());
+  const lines = rawLines.map(cleanInteractiveLine).filter(Boolean);
+  const tail = lines.slice(-30);
+  const tailText = tail.join('\n');
+  const state = {
+    type: 'unknown',
+    prompt: '',
+    options: [],
+    selected: null,
+    submitAvailable: /\bSubmit\b/i.test(tailText),
+    rawTail: tail,
+  };
+
+  if (/\b(Allow|Deny|allow once|allow always|permission|permissions)\b/i.test(tailText) && /\b(Yes|No|Allow|Deny|y\/n)\b/i.test(tailText)) {
+    state.type = 'permission';
+  } else if (/\b(Yes|No|Confirm|Cancel|确认|取消|继续|拒绝)\b/i.test(tailText) && /[？?]$/.test(tailText.replace(/\n/g, ' '))) {
+    state.type = 'confirm';
+  }
+
+  for (const line of tail) {
+    let match = line.match(/^[❯>→\-*•○●◉☐☑✔\s]*(\d+)[.)、]\s+(.+)$/);
+    if (match) {
+      state.options.push(match[2].trim());
+      if (/^[❯>→]/.test(line)) state.selected = state.options.length - 1;
+      continue;
+    }
+    match = line.match(/^[❯>→\-*•○●◉☐☑✔\s]+([^\s].+)$/);
+    if (match && !/^(Submit|Skills|Using|Context Usage)/i.test(match[1])) {
+      const option = match[1].trim();
+      if (option.length <= 80 && !/[？?]$/.test(option)) {
+        state.options.push(option);
+        if (/^[❯>→]/.test(line)) state.selected = state.options.length - 1;
+      }
+    }
+  }
+
+  const promptCandidates = tail.filter(line =>
+    !/^←/.test(line) &&
+    !/^❯\s*\d/.test(line) &&
+    !/^\d+[.)、]/.test(line) &&
+    !/\bSubmit\b/i.test(line) &&
+    !/^(Skills|Using|Context Usage|Opus|claude-)/i.test(line) &&
+    (/[？?]$/.test(line) || /用什么|选择|输入|是否|确认|允许|可见性|仓库名/.test(line))
+  );
+  state.prompt = promptCandidates[promptCandidates.length - 1] || '';
+
+  if (state.type === 'unknown') {
+    if (state.options.length > 0) state.type = 'select';
+    else if (state.prompt || state.submitAvailable || /❯\s*$/.test(tailText)) state.type = 'text_input';
+  }
+
+  state.options = [...new Set(state.options)].slice(0, 8);
+  return state;
+}
+
+function formatInteractivePrompt(state, response) {
+  const parts = [];
+  if (response) parts.push(response);
+  if (state.prompt && (!response || !response.includes(state.prompt))) parts.push(state.prompt);
+
+  if (state.type === 'permission') {
+    parts.push('当前需要权限确认。请回复：允许 / 拒绝，或按界面提示回复具体选项。');
+  } else if (state.type === 'confirm') {
+    parts.push('当前需要确认。请回复：确认 / 取消，或按界面提示回复具体选项。');
+  } else if (state.type === 'select') {
+    if (state.options.length) {
+      parts.push('当前需要选择一个选项，请回复编号或选项内容：');
+      state.options.forEach((option, index) => {
+        const marker = state.selected === index ? '（当前选中）' : '';
+        parts.push(`${index + 1}. ${option}${marker}`);
+      });
+    } else {
+      parts.push('当前需要选择一个选项，请回复编号或选项内容。');
+    }
+  } else if (state.type === 'text_input') {
+    parts.push('当前需要输入内容，请直接回复要填写的内容。');
+  } else {
+    parts.push('Claude 正在等待进一步输入，请按当前界面回复下一步内容。');
+  }
+
+  if (state.submitAvailable && state.type !== 'text_input') {
+    parts.push('如果已选好，也可以回复“确认/提交”。');
+  }
+  return parts.filter(Boolean).join('\n');
+}
+
+function interactivePromptMessage(session, response) {
+  return formatInteractivePrompt(parseInteractiveState(session.vt), response);
+}
+
+function transitionToInteractivePrompt(session) {
+  if (session.doneTimer) { clearTimeout(session.doneTimer); session.doneTimer = null; }
+  if (session.sentMsgTimeout) { clearTimeout(session.sentMsgTimeout); session.sentMsgTimeout = null; }
+  if (session._processingWatchdog) { clearInterval(session._processingWatchdog); session._processingWatchdog = null; }
+  session.phase = 'awaiting_input';
+  session.status = 'idle';
+  log(session.id, 'Claude is waiting for interactive input');
+  broadcast(session, { type: 'status', status: 'idle', sessionId: session.id });
+  broadcastAll({ type: 'sessions', sessions: sessionList() });
+  const response = extractResponse(session.vt, session.currentRequest?.text);
+  if (response && response !== session.lastExtractedResponse) {
+    session.lastExtractedResponse = response;
+    const request = session.currentRequest || {};
+    if (!request.internal && request.persistHistory !== false) {
+      const entry = { role: 'assistant', content: response, timestamp: Date.now() };
+      session.history.push(entry);
+      saveSessionState(session);
+      broadcast(session, { type: 'message', ...entry, sessionId: session.id });
+    }
+    while (session.pendingCallbacks.length > 0) {
+      const item = session.pendingCallbacks.shift();
+      const cb = typeof item === 'function' ? item : item.cb;
+      try { if (cb) cb(interactivePromptMessage(session, response)); } catch(e) { log(session.id, `Callback error: ${e.message}`); }
+    }
+  } else {
+    while (session.pendingCallbacks.length > 0) {
+      const item = session.pendingCallbacks.shift();
+      const cb = typeof item === 'function' ? item : item.cb;
+      try { if (cb) cb(interactivePromptMessage(session, null)); } catch(e) { log(session.id, `Callback error: ${e.message}`); }
+    }
+  }
+  session.currentRequest = null;
+  saveSessionState(session);
 }
 
 function transitionToProcessing(session) {
@@ -632,7 +1068,10 @@ function scheduleStabilityCheck(session, reason) {
     }
 
     // Screen stable — confirm done
-    if (currentType === 'idle' || currentType === 'done' || currentType === 'unknown') {
+    if (currentType === 'interactive_prompt') {
+      log(session.id, `Stability confirmed (${reason}, type=${currentType}): waiting for interactive input`);
+      transitionToInteractivePrompt(session);
+    } else if (currentType === 'idle' || currentType === 'done' || currentType === 'unknown') {
       log(session.id, `Stability confirmed (${reason}, type=${currentType}): finishing response`);
       finishResponse(session, reason);
     } else if (currentType === 'processing') {
@@ -653,73 +1092,118 @@ function finishResponse(session, reason, preExtracted) {
   session._stabilitySnapshot = null;
   log(session.id, `Response done (${reason})`);
 
-  // Use pre-extracted response to avoid race condition where screen changes
-  // between the caller's extractResponse and this one
-  const response = preExtracted || extractResponse(session.vt);
+  const request = session.currentRequest || {};
+  session.currentRequest = null;
+  const response = preExtracted || extractResponse(session.vt, request.text);
+  updateContextUsageFromText(session, response || getScreenText(session.vt));
+  discoverClaudeSessionIdFromLocalLogs(session);
+
   if (response) {
     session.lastExtractedResponse = response;
-    session.restartCount = 0;  // Successful response — reset restart counter
+    session.restartCount = 0;
     log(session.id, `Response (${response.length} chars): ${response.substring(0, 150)}`);
-    const entry = { role: 'assistant', content: response, timestamp: Date.now() };
-    session.history.push(entry);
-    broadcast(session, { type: 'message', ...entry, sessionId: session.id });
+    if (!request.internal && request.persistHistory !== false) {
+      const entry = { role: 'assistant', content: response, timestamp: Date.now() };
+      session.history.push(entry);
+      session.context = {
+        ...(session.context || {}),
+        turnsSinceLastCheck: (session.context?.turnsSinceLastCheck || 0) + 1,
+      };
+      saveSessionState(session);
+      broadcast(session, { type: 'message', ...entry, sessionId: session.id });
+    } else {
+      markInternalComplete(session, request.kind, response);
+    }
 
-    // Notify external callers (wecom.js)
     while (session.pendingCallbacks.length > 0) {
-      const cb = session.pendingCallbacks.shift();
-      try { cb(response); } catch(e) { log(session.id, `Callback error: ${e.message}`); }
+      const item = session.pendingCallbacks.shift();
+      const cb = typeof item === 'function' ? item : item.cb;
+      if (cb) {
+        try { cb(response); } catch(e) { log(session.id, `Callback error: ${e.message}`); }
+      }
     }
   } else {
-    log(session.id, 'No response extracted! Dumping screen:');
-    const lines = getScreenLines(session.vt);
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].trim()) log(session.id, `  L${i}: ${lines[i]}`);
+    if (request.internal) {
+      markInternalComplete(session, request.kind, null);
+      log(session.id, `Internal response had no extractable output (${request.kind})`);
+    } else {
+      log(session.id, 'No response extracted! Dumping screen:');
+      const lines = getScreenLines(session.vt);
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].trim()) log(session.id, `  L${i}: ${lines[i]}`);
+      }
     }
-    // Still notify callbacks with empty response so they don't hang
     while (session.pendingCallbacks.length > 0) {
-      const cb = session.pendingCallbacks.shift();
-      try { cb(null); } catch(e) {}
+      const item = session.pendingCallbacks.shift();
+      const cb = typeof item === 'function' ? item : item.cb;
+      try { if (cb) cb(null); } catch(e) {}
     }
   }
 
+  saveSessionState(session);
   broadcast(session, { type: 'status', status: 'idle', sessionId: session.id });
   broadcastAll({ type: 'sessions', sessions: sessionList() });
 
-  // Process next queued message if any
-  setTimeout(() => _drainQueue(session), 500);
+  setTimeout(() => {
+    maybeScheduleContextMaintenance(session);
+    _drainQueue(session);
+  }, 500);
 }
 
-/**
- * Send a message to Claude and get the response via callback.
- * Used by wecom.js for enterprise WeChat integration.
- * @param {object} session - Claude session object
- * @param {string} text - Message text to send
- * @param {function} onComplete - callback(responseText | null)
- * @returns {{ ok: boolean, error?: string }}
- */
-function sendToClaude(session, text, onComplete) {
+function normalizeInteractiveInput(text) {
+  const trimmed = String(text || '').trim().toLowerCase();
+  if (/^(确认|提交|确定|ok|yes|y)$/.test(trimmed)) return '\r';
+  if (/^(取消|不要|否|no|n)$/.test(trimmed)) return '\x1b';
+  return null;
+}
+
+function sendToClaude(session, text, onComplete, options = {}) {
   if (!session || !session.ptyProc) {
     return { ok: false, error: 'Session not running' };
   }
 
-  // Queue message if busy
+  if (session.phase === 'awaiting_input' && !options.internal) {
+    _sendMessageNow(session, text, onComplete, { ...options, interactiveReply: true });
+    return { ok: true };
+  }
+
+  if (!options.internal && session.context?.needsCompact && session.phase === 'idle') {
+    if (!session._messageQueue) session._messageQueue = [];
+    session._messageQueue.push({ text, onComplete, options });
+    enqueueInternalCommand(session, '/compact', { kind: 'compact', priority: true });
+    log(session.id, `Queued user message behind compaction (queue size: ${session._messageQueue.length})`);
+    return { ok: true, queued: true, compacting: true };
+  }
+
   if (session.phase !== 'idle') {
     if (!session._messageQueue) session._messageQueue = [];
-    session._messageQueue.push({ text, onComplete });
+    session._messageQueue.push({ text, onComplete, options });
     log(session.id, `Queued message (queue size: ${session._messageQueue.length}): ${text.substring(0, 50)}`);
     return { ok: true, queued: true };
   }
 
-  _sendMessageNow(session, text, onComplete);
+  _sendMessageNow(session, text, onComplete, options);
   return { ok: true };
 }
 
-function _sendMessageNow(session, text, onComplete) {
-  // Push user message
-  session.history.push({ role: 'user', content: text, timestamp: Date.now() });
-  broadcast(session, { type: 'message', role: 'user', content: text, timestamp: Date.now(), sessionId: session.id });
+function _sendMessageNow(session, text, onComplete, options = {}) {
+  const request = {
+    internal: Boolean(options.internal),
+    persistHistory: options.persistHistory !== false,
+    broadcast: options.broadcast !== false,
+    kind: options.kind || 'user',
+    interactiveReply: Boolean(options.interactiveReply),
+    text,
+  };
+  session.currentRequest = request;
 
-  // Set phase
+  if (!request.internal && request.persistHistory) {
+    const entry = { role: 'user', content: text, timestamp: Date.now() };
+    session.history.push(entry);
+    saveSessionState(session);
+    if (request.broadcast) broadcast(session, { type: 'message', ...entry, sessionId: session.id });
+  }
+
   session.phase = 'sent_msg';
   session.status = 'processing';
   session.userMsgSentAt = Date.now();
@@ -730,29 +1214,31 @@ function _sendMessageNow(session, text, onComplete) {
   if (session.doneTimer) { clearTimeout(session.doneTimer); session.doneTimer = null; }
   broadcast(session, { type: 'status', status: 'processing', sessionId: session.id });
 
-  log(session.id, `User msg (via wecom): ${text.substring(0, 80)}`);
+  log(session.id, `${request.internal ? 'Internal' : 'User'} msg (${request.kind}): ${text.substring(0, 80)}`);
 
-  // Register callback
   if (onComplete) {
-    session.pendingCallbacks.push(onComplete);
+    session.pendingCallbacks.push({ cb: onComplete, internal: request.internal, kind: request.kind });
   }
 
-  // Sanitize text: escape control chars that could mess up the PTY
-  const sanitized = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
+  const sanitized = request.interactiveReply && normalizeInteractiveInput(text) !== null
+    ? normalizeInteractiveInput(text)
+    : text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
 
-  // Write text + Enter (separated by 100ms)
   session.ptyProc.write(sanitized);
   const onDataCountBefore = session.onDataCount;
-  setTimeout(() => {
-    if (session.ptyProc) {
-      session.ptyProc.write('\r');
-      log(session.id, 'Enter sent after msg');
-    }
-  }, 100);
+  if (sanitized === '\r' || sanitized === '\x1b') {
+    log(session.id, `Interactive key sent: ${sanitized === '\r' ? 'Enter' : 'Escape'}`);
+  } else {
+    setTimeout(() => {
+      if (session.ptyProc) {
+        session.ptyProc.write('\r');
+        log(session.id, 'Enter sent after msg');
+      }
+    }, 100);
+  }
 
-  log(session.id, `PTY write: msgLen=${sanitized.length}, Enter scheduled in 100ms`);
+  log(session.id, `PTY write: msgLen=${sanitized.length}, Enter scheduled in ${sanitized === '\r' || sanitized === '\x1b' ? 0 : 100}ms`);
 
-  // Diagnostic: if no onData within 5s after write, Claude is stuck
   setTimeout(() => {
     if (session.onDataCount === onDataCountBefore && session.phase === 'sent_msg') {
       log(session.id, `DIAG: NO onData after 5s! PTY is unresponsive.`);
@@ -761,12 +1247,26 @@ function _sendMessageNow(session, text, onComplete) {
   }, 5000);
 }
 
+function enqueueInternalCommand(session, text, { kind, priority = false } = {}) {
+  if (session._maintenanceQueued === kind || (kind === 'compact' && session._maintenanceQueued === 'compact')) return;
+  session._maintenanceQueued = kind || 'internal';
+  const item = {
+    text,
+    onComplete: null,
+    options: { internal: true, persistHistory: false, broadcast: false, kind: kind || 'internal' },
+  };
+  if (!session._messageQueue) session._messageQueue = [];
+  if (priority) session._messageQueue.unshift(item);
+  else session._messageQueue.push(item);
+  if (session.phase === 'idle') _drainQueue(session);
+}
+
 function _drainQueue(session) {
   if (!session._messageQueue || session._messageQueue.length === 0) return;
   if (session.phase !== 'idle') return;
   const next = session._messageQueue.shift();
   log(session.id, `Draining queue (remaining: ${session._messageQueue.length}): ${next.text.substring(0, 50)}`);
-  _sendMessageNow(session, next.text, next.onComplete);
+  _sendMessageNow(session, next.text, next.onComplete, next.options || {});
 }
 
 /**
@@ -792,7 +1292,7 @@ function sendKeyToClaude(session, key) {
  * Returns the session object. Caller should store it for later assignment.
  */
 function warmupSession(id, cwd) {
-  const session = createSession(id, cwd);
+  const session = createSession(id, cwd, { durable: false });
   startClaude(session);
   log(id, 'Warmup session started');
   return session;
@@ -801,7 +1301,8 @@ function warmupSession(id, cwd) {
 module.exports = {
   createSession, sessions, sessionList, broadcast, broadcastAll,
   startClaude, stopPolling, log, sendToClaude, sendKeyToClaude,
-  warmupSession,
+  warmupSession, restorePersistedSessions, destroySession, saveSessionState,
   getScreenLines, getViewportLines, getScreenText, detectScreenType, extractResponse,
+  parseContextUsage, updateContextUsageFromText,
   COLS, ROWS, UPLOAD_DIR, LOG_FILE,
 };

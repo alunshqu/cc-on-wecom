@@ -153,10 +153,12 @@ function handleMessage(msg) {
       sessions.clear();
       msg.sessions.forEach(s => sessions.set(s.id, s));
       renderSessionList();
+      autoJoinSavedSession();
       break;
 
     case 'session_created':
       currentSessionId = msg.sessionId;
+      localStorage.setItem('happyweb.currentSessionId', msg.sessionId);
       document.getElementById('messages').innerHTML = '';
       showChat();
       updateStatus('starting');
@@ -268,9 +270,16 @@ function createSession() {
   ws.send(JSON.stringify({ type: 'create_session' }));
 }
 
+function autoJoinSavedSession() {
+  if (currentSessionId) return;
+  const savedId = localStorage.getItem('happyweb.currentSessionId');
+  if (savedId && sessions.has(savedId)) joinSession(savedId);
+}
+
 function joinSession(id) {
   if (currentSessionId === id) return;
   currentSessionId = id;
+  localStorage.setItem('happyweb.currentSessionId', id);
   document.getElementById('messages').innerHTML = '';
   showChat();
   ws.send(JSON.stringify({ type: 'join_session', sessionId: id }));
@@ -281,6 +290,7 @@ function deleteSession(id) {
   ws.send(JSON.stringify({ type: 'delete_session', sessionId: id }));
   if (currentSessionId === id) {
     currentSessionId = null;
+    localStorage.removeItem('happyweb.currentSessionId');
     document.getElementById('messages').innerHTML = '<div class="welcome"><h2>⚡ HappyWeb</h2><p>点击「新建会话」开始与 Claude 对话</p></div>';
     document.getElementById('chatHeader').style.display = 'none';
     document.getElementById('inputArea').style.display = 'none';

@@ -9,7 +9,7 @@ const {
   createSession, sessions, sessionList, startClaude, log,
   sendToClaude, sendKeyToClaude, broadcast, broadcastAll,
   getScreenLines, getScreenText, detectScreenType, extractResponse,
-  COLS, ROWS, UPLOAD_DIR, stopPolling,
+  COLS, ROWS, UPLOAD_DIR, restorePersistedSessions, destroySession,
 } = require('./session-manager');
 
 const LOG_FILE = '/tmp/happyweb-debug.log';
@@ -175,13 +175,7 @@ wss.on('connection', (ws) => {
       }
       case 'delete_session': {
         const sid = msg.sessionId;
-        const session = sessions.get(sid);
-        if (session) {
-          if (session.ptyProc) session.ptyProc.kill();
-          stopPolling(session);
-          session.clients.clear();
-          sessions.delete(sid);
-        }
+        destroySession(sid, { deleteState: true });
         broadcastAll({ type: 'sessions', sessions: sessionList() });
         break;
       }
@@ -194,6 +188,8 @@ wss.on('connection', (ws) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────
+restorePersistedSessions({ start: true });
+
 const PORT = process.env.PORT || 8890;
 server.listen(PORT, () => {
   log('server', `HappyWeb listening on http://localhost:${PORT}`);

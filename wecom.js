@@ -5,8 +5,10 @@ const { WSClient, generateReqId } = AiBot;
 const {
   createSession, sessions, sessionList, startClaude, log,
   sendToClaude, sendKeyToClaude, broadcastAll, warmupSession,
+  destroySession, saveSessionState,
   UPLOAD_DIR,
 } = require('./session-manager');
+const durableState = require('./durable-state');
 
 // ── Config ────────────────────────────────────────────────────────────────
 const BOT_ID = process.env.WECOM_BOT_ID;
@@ -22,7 +24,27 @@ log('wecom', `Starting WeCom bot: botId=${BOT_ID}`);
 
 // ── Session mapping ───────────────────────────────────────────────────────
 // Maps WeChat userid → Claude session id
-const userSessionMap = new Map();
+const userSessionMap = durableState.loadWecomUserSessionMap();
+
+function saveUserSessionMap() {
+  durableState.saveWecomUserSessionMap(userSessionMap);
+}
+
+function setUserSession(userId, sessionId) {
+  userSessionMap.set(userId, sessionId);
+  saveUserSessionMap();
+}
+
+function removeSessionMappings(sessionId) {
+  let changed = false;
+  for (const [userId, mappedSessionId] of userSessionMap) {
+    if (mappedSessionId === sessionId) {
+      userSessionMap.delete(userId);
+      changed = true;
+    }
+  }
+  if (changed) saveUserSessionMap();
+}
 
 // Pre-warm a Claude session at startup for instant first message
 const WARM_SESSION_ID = 'wecom_warmup';
@@ -42,9 +64,11 @@ function getUserSession(userId) {
     const id = `wecom_${userId.slice(-6)}`;
     const claimed = warmSession;
     claimed.id = id;
+    claimed.durable = true;
     sessions.delete(WARM_SESSION_ID);
     sessions.set(id, claimed);
-    userSessionMap.set(userId, id);
+    setUserSession(userId, id);
+    saveSessionState(claimed);
     log('wecom', `Assigned warm session to user ${userId} (${id})`);
     warmSession = null; // consumed
     return claimed;
@@ -52,7 +76,7 @@ function getUserSession(userId) {
   // Create new session
   const id = `wecom_${userId.slice(-6)}`;
   const session = createSession(id, process.env.HOME);
-  userSessionMap.set(userId, id);
+  setUserSession(userId, id);
   startClaude(session);
   log('wecom', `Created session ${id} for user ${userId}`);
   return session;
@@ -347,7 +371,7 @@ async function handleCommand(frame, userId, text) {
         await replyText(frame, `❌ 会话 ${targetId} 不存在`);
         break;
       }
-      userSessionMap.set(userId, targetId);
+      setUserSession(userId, targetId);
       await replyText(frame, `✅ 已切换到会话: ${targetId}`);
       break;
     }
@@ -384,8 +408,8 @@ async function handleCommand(frame, userId, text) {
       }
       const killSession = sessions.get(killId);
       if (killSession) {
-        if (killSession.ptyProc) killSession.ptyProc.kill();
-        sessions.delete(killId);
+        destroySession(killId, { deleteState: true });
+        removeSessionMappings(killId);
         broadcastAll({ type: 'sessions', sessions: sessionList() });
         await replyText(frame, `🗑 会话 ${killId} 已删除`);
       } else {
@@ -440,11 +464,15 @@ async function handleCommand(frame, userId, text) {
 // Normal message → Claude
 // ═══════════════════════════════════════════════════════════════════════════
 
+function isInputReady(session) {
+  return session.phase === 'idle' || session.phase === 'awaiting_input';
+}
+
 async function waitForIdle(session, maxWaitMs = 30000) {
-  if (session.phase === 'idle') return true;
+  if (isInputReady(session)) return true;
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
-    if (session.phase === 'idle') return true;
+    if (isInputReady(session)) return true;
     if (session.phase === 'stopped') return false;
     await new Promise(r => setTimeout(r, 500));
   }
@@ -455,7 +483,7 @@ async function handleNormalMessage(frame, userId, text) {
   const session = getUserSession(userId);
 
   // Wait for Claude to be ready (handles first-message race with init)
-  if (session.phase !== 'idle') {
+  if (!isInputReady(session)) {
     const streamId = generateReqId('stream');
     try {
       await wsClient.replyStream(frame, streamId, '⏳ 等待 Claude 就绪...', false);
@@ -509,7 +537,7 @@ async function handleNormalMessage(frame, userId, text) {
  * Send a Claude CLI command and stream the response back.
  */
 async function sendToClaudeAsync(frame, session, cmd) {
-  if (session.phase !== 'idle') {
+  if (!isInputReady(session)) {
     await replyText(frame, `⏳ Claude 正在处理中（${session.phase}），请稍候...`);
     return;
   }
@@ -595,7 +623,7 @@ async function handleStatus(frame, session) {
 function createNewSessionForUser(userId) {
   const id = `wecom_${userId.slice(-6)}_${Date.now().toString(36)}`;
   const session = createSession(id, process.env.HOME);
-  userSessionMap.set(userId, id);
+  setUserSession(userId, id);
   startClaude(session);
   log('wecom', `New session ${id} for user ${userId}`);
   return session;
@@ -639,11 +667,13 @@ log('wecom', 'WeCom bot connecting...');
 process.on('SIGINT', () => {
   log('wecom', 'Shutting down...');
   wsClient.disconnect();
+  setTimeout(() => process.exit(0), 100);
 });
 
 process.on('SIGTERM', () => {
   log('wecom', 'Shutting down...');
   wsClient.disconnect();
+  setTimeout(() => process.exit(0), 100);
 });
 
 module.exports = { wsClient, userSessionMap };
