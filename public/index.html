@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HappyWeb - Claude Code</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg: #0d1117; --surface: #161b22; --border: #30363d;
+      --text: #e6edf3; --text-dim: #8b949e; --accent: #58a6ff;
+      --green: #3fb950; --red: #f85149; --yellow: #d29922;
+      --user-bg: #1f6feb22; --user-border: #1f6feb44;
+      --claude-bg: #bc8cff11; --claude-border: #bc8cff33;
+    }
+    html, body { height: 100%; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+    .app { display: flex; height: 100vh; }
+
+    /* Sidebar */
+    .sidebar { width: 240px; min-width: 240px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; }
+    .sidebar-header { padding: 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 10px; }
+    .sidebar-header h1 { font-size: 18px; font-weight: 600; }
+    .session-list { flex: 1; overflow-y: auto; padding: 8px; }
+    .session-item { padding: 10px 12px; border-radius: 6px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; transition: background 0.15s; }
+    .session-item:hover { background: var(--border); }
+    .session-item.active { background: #1f6feb33; border: 1px solid var(--accent); }
+    .session-item .sid { font-size: 12px; font-family: monospace; color: var(--text-dim); }
+    .session-item .meta { font-size: 10px; color: var(--text-dim); }
+    .session-item .status { font-size: 10px; padding: 2px 6px; border-radius: 10px; }
+    .session-item .status.idle { background: #238636; color: #fff; }
+    .session-item .status.processing { background: #d29922; color: #fff; }
+    .session-item .status.starting { background: #6e7681; color: #fff; }
+    .session-item .status.stopped { background: #6e7681; color: #fff; }
+    .session-item .delete-btn { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 14px; padding: 2px 6px; border-radius: 4px; opacity: 0; }
+    .session-item:hover .delete-btn { opacity: 1; }
+    .session-item .delete-btn:hover { color: var(--red); background: #f8514922; }
+    .new-session-btn { margin: 8px; padding: 10px; background: var(--accent); color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; }
+    .new-session-btn:hover { background: #4c9aed; }
+
+    /* Main */
+    .main { flex: 1; display: flex; flex-direction: column; }
+    .chat-header { padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--surface); display: flex; align-items: center; gap: 12px; }
+    .chat-header .status-dot { width: 8px; height: 8px; border-radius: 50%; }
+    .chat-header .status-dot.idle { background: var(--green); }
+    .chat-header .status-dot.processing { background: var(--yellow); animation: pulse 1s infinite; }
+    .chat-header .status-dot.starting { background: var(--text-dim); }
+    .chat-header .status-dot.stopped { background: var(--red); }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .chat-header .info { font-size: 12px; color: var(--text-dim); }
+
+    /* Messages */
+    .messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+    .msg { max-width: 85%; padding: 12px 16px; border-radius: 12px; line-height: 1.6; font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+    .msg.user { align-self: flex-end; background: var(--user-bg); border: 1px solid var(--user-border); border-bottom-right-radius: 4px; }
+    .msg.assistant { align-self: flex-start; background: var(--claude-bg); border: 1px solid var(--claude-border); border-bottom-left-radius: 4px; }
+    .msg .msg-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; font-size: 11px; color: var(--text-dim); }
+    .msg .msg-role { font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+    .msg .msg-role.user { color: var(--accent); }
+    .msg .msg-role.assistant { color: #bc8cff; }
+    .msg .msg-body { margin-top: 4px; }
+    .msg .msg-meta { display: flex; gap: 12px; margin-top: 8px; font-size: 11px; color: var(--text-dim); }
+
+    /* Loading */
+    .loading { align-self: flex-start; padding: 12px 16px; border-radius: 12px; background: var(--claude-bg); border: 1px solid var(--claude-border); display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-dim); }
+    .loading .dots { display: flex; gap: 4px; }
+    .loading .dots span { width: 6px; height: 6px; border-radius: 50%; background: #bc8cff; animation: bounce 1.4s infinite; }
+    .loading .dots span:nth-child(2) { animation-delay: 0.2s; }
+    .loading .dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes bounce { 0%, 80%, 100% { transform: translateY(0); } 40% { transform: translateY(-8px); } }
+
+    /* Input */
+    .input-area { padding: 16px; border-top: 1px solid var(--border); background: var(--surface); }
+    .input-row { display: flex; gap: 8px; align-items: flex-end; }
+    .input-row textarea { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 10px 14px; border-radius: 8px; font-size: 14px; font-family: inherit; resize: none; min-height: 42px; max-height: 120px; line-height: 1.4; }
+    .input-row textarea:focus { outline: none; border-color: var(--accent); }
+    .input-row textarea::placeholder { color: var(--text-dim); }
+    .input-row button { padding: 10px 20px; background: var(--accent); color: #fff; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; white-space: nowrap; }
+    .input-row button:hover { background: #4c9aed; }
+    .input-row button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .input-row .attach-btn { padding: 10px 12px; background: var(--border); font-size: 18px; line-height: 1; }
+    .input-row .attach-btn:hover { background: #484f58; }
+    .input-hint { margin-top: 6px; font-size: 11px; color: var(--text-dim); }
+
+    /* File chips */
+    .file-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+    .file-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; background: #1f6feb22; border: 1px solid #1f6feb44; border-radius: 16px; font-size: 12px; color: var(--text); }
+    .file-chip .chip-icon { font-size: 14px; }
+    .file-chip .chip-name { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-chip .chip-size { color: var(--text-dim); font-size: 10px; }
+    .file-chip .chip-remove { background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 14px; padding: 0 2px; line-height: 1; }
+    .file-chip .chip-remove:hover { color: var(--red); }
+    .file-chip.uploading { opacity: 0.6; }
+    .file-chip.error { border-color: var(--red); background: #f8514922; }
+
+    /* File attachment in messages */
+    .msg .file-attachment { margin-top: 8px; padding: 6px 10px; background: rgba(255,255,255,0.05); border-radius: 6px; font-size: 12px; display: inline-flex; align-items: center; gap: 6px; }
+    .msg .file-attachment .fa-icon { font-size: 14px; }
+
+    /* Welcome */
+    .welcome { flex: 1; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 16px; color: var(--text-dim); }
+    .welcome h2 { font-size: 24px; color: var(--text); }
+    .welcome p { font-size: 14px; }
+  </style>
+</head>
+<body>
+<div class="app">
+  <div class="sidebar">
+    <div class="sidebar-header"><span>⚡</span><h1>HappyWeb</h1></div>
+    <div class="session-list" id="sessionList"></div>
+    <button class="new-session-btn" onclick="createSession()">+ 新建会话</button>
+  </div>
+  <div class="main">
+    <div class="chat-header" id="chatHeader" style="display:none">
+      <span class="status-dot" id="statusDot"></span>
+      <span class="info" id="headerInfo"></span>
+    </div>
+    <div class="messages" id="messages">
+      <div class="welcome">
+        <h2>⚡ HappyWeb</h2>
+        <p>点击「新建会话」开始与 Claude 对话</p>
+      </div>
+    </div>
+    <div class="input-area" id="inputArea" style="display:none">
+      <div class="file-chips" id="fileChips"></div>
+      <div class="input-row">
+        <button class="attach-btn" onclick="document.getElementById('fileInput').click()" title="上传文件">📎</button>
+        <input type="file" id="fileInput" style="display:none" multiple onchange="onFilesSelected(this.files)">
+        <textarea id="msgInput" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1"></textarea>
+        <button id="sendBtn" onclick="sendMessage()">发送</button>
+      </div>
+      <div class="input-hint">Enter 发送 · Shift+Enter 换行 · 📎 上传文件</div>
+    </div>
+  </div>
+</div>
+
+<script>
+let ws = null;
+let currentSessionId = null;
+const sessions = new Map();
+const pendingFiles = []; // { file, serverPath, status }
+
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}`);
+  ws.onopen = () => ws.send(JSON.stringify({ type: 'list_sessions' }));
+  ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
+  ws.onclose = () => setTimeout(connectWS, 2000);
+}
+
+function handleMessage(msg) {
+  switch (msg.type) {
+    case 'sessions':
+      sessions.clear();
+      msg.sessions.forEach(s => sessions.set(s.id, s));
+      renderSessionList();
+      break;
+
+    case 'session_created':
+      currentSessionId = msg.sessionId;
+      document.getElementById('messages').innerHTML = '';
+      showChat();
+      updateStatus('starting');
+      ws.send(JSON.stringify({ type: 'list_sessions' }));
+      break;
+
+    case 'history':
+      if (msg.sessionId !== currentSessionId) break;
+      const container = document.getElementById('messages');
+      container.innerHTML = '';
+      msg.messages.forEach(m => appendMessage(m.role, m.content, m.timestamp));
+      scrollToBottom();
+      break;
+
+    case 'message':
+      if (msg.sessionId !== currentSessionId) break;
+      removeLoading();
+      appendMessage(msg.role, msg.content, msg.timestamp);
+      scrollToBottom();
+      break;
+
+    case 'status':
+      if (msg.sessionId === currentSessionId) updateStatus(msg.status);
+      const s = sessions.get(msg.sessionId);
+      if (s) s.status = msg.status;
+      renderSessionList();
+      break;
+
+    case 'exited':
+      if (msg.sessionId === currentSessionId) updateStatus('stopped');
+      const s2 = sessions.get(msg.sessionId);
+      if (s2) s2.status = 'stopped';
+      renderSessionList();
+      break;
+
+    case 'error':
+      removeLoading();
+      appendMessage('system', msg.text, Date.now());
+      break;
+  }
+}
+
+function appendMessage(role, content, timestamp) {
+  const container = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  const time = new Date(timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  div.innerHTML = `
+    <div class="msg-header">
+      <span class="msg-role ${role}">${role === 'user' ? 'You' : role === 'assistant' ? 'Claude' : 'System'}</span>
+      <span class="msg-time">${time}</span>
+    </div>
+    <div class="msg-body">${escapeHtml(content)}</div>
+  `;
+  container.appendChild(div);
+}
+
+function showLoading() {
+  removeLoading();
+  const container = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'loading';
+  div.id = 'loadingMsg';
+  div.innerHTML = '<div class="dots"><span></span><span></span><span></span></div> Claude 思考中...';
+  container.appendChild(div);
+  scrollToBottom();
+}
+
+function removeLoading() {
+  const el = document.getElementById('loadingMsg');
+  if (el) el.remove();
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function scrollToBottom() {
+  const el = document.getElementById('messages');
+  el.scrollTop = el.scrollHeight;
+}
+
+function updateStatus(status) {
+  const dot = document.getElementById('statusDot');
+  dot.className = `status-dot ${status}`;
+  const info = document.getElementById('headerInfo');
+  const labels = { starting: '启动中...', idle: '就绪', processing: '思考中...', stopped: '已停止' };
+  info.textContent = labels[status] || status;
+
+  const btn = document.getElementById('sendBtn');
+  const input = document.getElementById('msgInput');
+  if (status === 'idle') {
+    btn.disabled = false;
+    input.disabled = false;
+    removeLoading();
+  } else {
+    btn.disabled = true;
+    input.disabled = true;
+    if (status === 'processing') showLoading();
+  }
+}
+
+function showChat() {
+  document.getElementById('chatHeader').style.display = '';
+  document.getElementById('inputArea').style.display = '';
+}
+
+function createSession() {
+  ws.send(JSON.stringify({ type: 'create_session' }));
+}
+
+function joinSession(id) {
+  if (currentSessionId === id) return;
+  currentSessionId = id;
+  document.getElementById('messages').innerHTML = '';
+  showChat();
+  ws.send(JSON.stringify({ type: 'join_session', sessionId: id }));
+  renderSessionList();
+}
+
+function deleteSession(id) {
+  ws.send(JSON.stringify({ type: 'delete_session', sessionId: id }));
+  if (currentSessionId === id) {
+    currentSessionId = null;
+    document.getElementById('messages').innerHTML = '<div class="welcome"><h2>⚡ HappyWeb</h2><p>点击「新建会话」开始与 Claude 对话</p></div>';
+    document.getElementById('chatHeader').style.display = 'none';
+    document.getElementById('inputArea').style.display = 'none';
+  }
+}
+
+function sendMessage() {
+  const input = document.getElementById('msgInput');
+  const text = input.value.trim();
+  if ((!text && pendingFiles.length === 0) || !currentSessionId) return;
+
+  // Build message: text + file paths
+  let fullMsg = text;
+  const uploadedFiles = pendingFiles.filter(f => f.serverPath);
+  if (uploadedFiles.length > 0) {
+    const fileList = uploadedFiles.map(f => `[附件: ${f.serverPath}]`).join('\n');
+    fullMsg = fullMsg ? fullMsg + '\n\n' + fileList : fileList;
+  }
+
+  if (!fullMsg.trim()) return;
+
+  showLoading();
+  ws.send(JSON.stringify({ type: 'send', text: fullMsg, sessionId: currentSessionId }));
+  input.value = '';
+  input.style.height = 'auto';
+
+  // Clear file chips
+  pendingFiles.length = 0;
+  renderFileChips();
+}
+
+// --- File upload ---
+function onFilesSelected(fileList) {
+  for (const file of fileList) {
+    const entry = { file, serverPath: null, status: 'uploading' };
+    pendingFiles.push(entry);
+    renderFileChips();
+    uploadFile(entry);
+  }
+  // Reset input so same file can be re-selected
+  document.getElementById('fileInput').value = '';
+}
+
+async function uploadFile(entry) {
+  const form = new FormData();
+  form.append('file', entry.file);
+  try {
+    const resp = await fetch('/upload', { method: 'POST', body: form });
+    const data = await resp.json();
+    if (data.success) {
+      entry.serverPath = data.path;
+      entry.status = 'done';
+    } else {
+      entry.status = 'error';
+      entry.error = data.error || 'Upload failed';
+    }
+  } catch (err) {
+    entry.status = 'error';
+    entry.error = err.message;
+  }
+  renderFileChips();
+}
+
+function removeFile(idx) {
+  pendingFiles.splice(idx, 1);
+  renderFileChips();
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+}
+
+function renderFileChips() {
+  const container = document.getElementById('fileChips');
+  container.innerHTML = '';
+  pendingFiles.forEach((f, i) => {
+    const chip = document.createElement('div');
+    chip.className = `file-chip ${f.status === 'uploading' ? 'uploading' : ''} ${f.status === 'error' ? 'error' : ''}`;
+    const icon = f.status === 'uploading' ? '⏳' : f.status === 'error' ? '❌' : '📄';
+    const info = f.status === 'error' ? f.error : f.status === 'uploading' ? '上传中...' : formatSize(f.file.size);
+    chip.innerHTML = `<span class="chip-icon">${icon}</span><span class="chip-name">${escapeHtml(f.file.name)}</span><span class="chip-size">${info}</span><button class="chip-remove" onclick="removeFile(${i})">✕</button>`;
+    container.appendChild(chip);
+  });
+}
+
+function renderSessionList() {
+  const list = document.getElementById('sessionList');
+  list.innerHTML = '';
+  for (const [id, s] of sessions) {
+    const item = document.createElement('div');
+    item.className = `session-item ${id === currentSessionId ? 'active' : ''}`;
+    const time = new Date(s.created).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    item.innerHTML = `
+      <div>
+        <div class="sid">${id}</div>
+        <div class="meta">${time} · ${s.messageCount || 0} 条</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px">
+        <span class="status ${s.status}">${s.status}</span>
+        <button class="delete-btn" onclick="event.stopPropagation();deleteSession('${id}')">✕</button>
+      </div>
+    `;
+    item.onclick = () => joinSession(id);
+    list.appendChild(item);
+  }
+}
+
+// Auto-resize textarea
+document.getElementById('msgInput').addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+});
+
+// Enter to send, Shift+Enter for newline
+document.getElementById('msgInput').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+connectWS();
+</script>
+</body>
+</html>

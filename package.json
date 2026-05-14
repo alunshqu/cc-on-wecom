@@ -1,0 +1,16 @@
+{
+  "name": "claude-code-on-wecom",
+  "version": "1.0.0",
+  "description": "Web-based Claude Code proxy",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@wecom/aibot-node-sdk": "^1.0.7",
+    "@xterm/headless": "^6.0.0",
+    "dotenv": "^17.4.2",
+    "node-pty": "^1.1.0",
+    "ws": "^8.20.0"
+  }
+}

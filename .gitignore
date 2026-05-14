@@ -1,0 +1,16 @@
+node_modules/
+uploads/
+dist/
+build/
+
+.env
+.env.*.local
+*.local
+
+*.log
+pnpm-debug.log*
+
+.DS_Store
+Thumbs.db
+
+package-lock.json
