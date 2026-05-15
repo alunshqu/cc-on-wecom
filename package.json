@@ -1,10 +1,11 @@
 {
-  "name": "claude-code-on-wecom",
-  "version": "1.0.0",
-  "description": "Web-based Claude Code proxy",
-  "main": "server.js",
+  "name": "cc-on-wecom",
+  "version": "2.0.0",
+  "description": "Multi-channel Claude Code gateway with layered architecture",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js",
+    "start:legacy": "node server.js"
   },
   "dependencies": {
     "@wecom/aibot-node-sdk": "^1.0.7",
