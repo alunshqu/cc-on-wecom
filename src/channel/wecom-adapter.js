@@ -42,7 +42,16 @@ class WeComAdapter extends BaseAdapter {
   }
 
   async send(userId, message) {
-    // WeComAdapter uses frame-based replies, not direct userId sends
+    if (!this.wsClient) return;
+    const content = typeof message === 'string' ? message : message.content;
+    try {
+      await this.wsClient.sendMessage(userId, {
+        msgtype: 'markdown',
+        markdown: { content },
+      });
+    } catch (e) {
+      log('wecom', `sendMessage to ${userId} failed: ${e.message}`);
+    }
   }
 
   _warmUp() {
@@ -201,12 +210,12 @@ class WeComAdapter extends BaseAdapter {
         const newSession = this.store.create(id, { cwd: process.env.HOME });
         this.store.setUserSession(userId, id);
         newSession.start();
-        await this._replyText(frame, `新会话已创建: ${id}`);
+        await this._replyText(frame, `✅ 新会话 ${id}`);
         break;
       }
       case 'stop': {
         session.sendKey('ctrl+c');
-        await this._replyText(frame, '已发送中断信号');
+        await this._replyText(frame, '⏹ 已中断');
         break;
       }
       default:
@@ -231,19 +240,19 @@ class WeComAdapter extends BaseAdapter {
         const newSession = this.store.create(id, { cwd: process.env.HOME });
         this.store.setUserSession(userId, id);
         newSession.start();
-        await this._replyText(frame, `新会话已创建: ${id}`);
+        await this._replyText(frame, `✅ 新会话 ${id}`);
         break;
       }
       case '/sessions': {
         const list = this.store.list();
         if (!list.length) { await this._replyText(frame, '暂无活跃会话'); break; }
-        const lines = list.map(s => `• \`${s.id}\` — ${s.status} | ${s.messageCount} msgs`);
-        await this._replyText(frame, `**活跃会话** (${list.length})\n\n${lines.join('\n')}`);
+        const lines = list.map(s => `• \`${s.id}\` ${s.status} (${s.messageCount}条)`);
+        await this._replyText(frame, lines.join('\n'));
         break;
       }
       case '/stop': {
         session.sendKey('ctrl+c');
-        await this._replyText(frame, '已发送中断信号');
+        await this._replyText(frame, '⏹ 已中断');
         break;
       }
       case '/status': {
@@ -252,16 +261,14 @@ class WeComAdapter extends BaseAdapter {
       }
       case '/help': {
         await this._replyText(frame, [
-          '**可用命令：**', '',
-          '`/context` — 上下文用量', '`/compact` — 压缩上下文',
-          '`/model` — 查看/切换模型', '`/plan` — 计划模式', '`/code` — 代码模式',
-          '`/status` — 会话状态', '`/sessions` — 会话列表',
-          '`/new` — 新建会话', '`/stop` — 中断操作',
+          '`/context` 上下文 | `/compact` 压缩 | `/model` 模型',
+          '`/plan` 计划 | `/code` 代码 | `/stop` 中断',
+          '`/new` 新建 | `/sessions` 列表 | `/status` 状态',
         ].join('\n'));
         break;
       }
       default:
-        await this._replyText(frame, `未知命令: \`${cmd}\`\n\n发送 \`/help\` 查看可用命令`);
+        await this._replyText(frame, `未知命令 \`${cmd}\`，发 /help 查看`);
     }
   }
 
@@ -271,53 +278,90 @@ class WeComAdapter extends BaseAdapter {
   }
 
   async _sendToClaudeStream(frame, session, text) {
+    const userId = frame.body?.from?.userid;
     const streamId = generateReqId('stream');
-    try { await this.wsClient.replyStream(frame, streamId, '⏳ 处理中...', false); } catch (_) {}
+
+    // Immediately ack with replyStream (within req_id validity window)
+    try { await this.wsClient.replyStream(frame, streamId, '⏳ 收到，处理中...', true); } catch (_) {}
 
     if (session.phase !== 'idle' && session.phase !== 'awaiting_input') {
       const ready = await this._waitForIdle(session, 30000);
       if (!ready) {
-        try { await this.wsClient.replyStream(frame, streamId, 'Claude 启动超时，请重试', true); } catch (_) {}
+        await this.send(userId, '⚠️ Claude 未就绪，请稍后重试');
         return;
       }
     }
 
     session.sendMessage(text, async (response) => {
-      try {
-        if (response) {
-          const chunks = this._splitResponse(response, 18000);
-          for (let i = 0; i < chunks.length; i++) {
-            await this.wsClient.replyStream(frame, streamId, chunks[i], i === chunks.length - 1);
-          }
-        } else {
-          await this.wsClient.replyStream(frame, streamId, '未能提取到响应，请重试', true);
+      if (response) {
+        const condensed = this._condenseResponse(response);
+        const chunks = this._splitResponse(condensed, 18000);
+        for (const chunk of chunks) {
+          await this.send(userId, chunk);
         }
-      } catch (e) {
-        log('wecom', `Stream reply error: ${e.message}`);
+      } else {
+        await this.send(userId, '⚠️ 未提取到响应，请重试');
       }
     });
   }
 
+  _condenseResponse(text) {
+    if (!text) return text;
+    const lines = text.split('\n');
+    const condensed = [];
+    let inToolBlock = false;
+    let toolBlockLines = 0;
+
+    for (const line of lines) {
+      // Detect tool output blocks (file contents, command output, etc.)
+      if (/^```/.test(line)) {
+        if (inToolBlock) {
+          inToolBlock = false;
+          if (toolBlockLines > 20) {
+            condensed.push(`  ... (${toolBlockLines} 行，已省略)`);
+          }
+          condensed.push(line);
+        } else {
+          inToolBlock = true;
+          toolBlockLines = 0;
+          condensed.push(line);
+        }
+        continue;
+      }
+
+      if (inToolBlock) {
+        toolBlockLines++;
+        if (toolBlockLines <= 20) condensed.push(line);
+        continue;
+      }
+
+      // Skip verbose tool summaries
+      if (/^(Read|Wrote|Created|Edited|Deleted|Searched|Listed|Found|Executed|Ran)\s+\d+/.test(line.trim())) continue;
+      if (/^[\/~][\w\/.@-]+:\d+/.test(line.trim())) continue;
+
+      condensed.push(line);
+    }
+
+    return condensed.join('\n').trim();
+  }
+
   async _sendStatusCard(frame, session) {
-    const phaseEmoji = { idle: '🟢', processing: '🟡', sent_msg: '🔵', init: '⚪', stopped: '🔴' };
+    const emoji = { idle: '🟢', processing: '🟡', sent_msg: '🔵', init: '⚪', stopped: '🔴' };
     try {
       await this.wsClient.replyTemplateCard(frame, {
         card_type: 'text_notice',
-        main_title: { title: '📋 会话状态' },
-        sub_title_text: [
-          `会话: ${session.id}`, `状态: ${phaseEmoji[session.phase] || '❓'} ${session.phase}`,
-          `消息: ${session.history.length} 条`, `目录: ${session.cwd}`,
-        ].join('\n'),
+        main_title: { title: `${emoji[session.phase] || '❓'} ${session.id}` },
+        sub_title_text: `${session.phase} | ${session.history.length}条 | ${session.cwd}`,
         button_list: [
-          { text: '🔄 新会话', key: 'new_session', style: 2 },
-          { text: '⏹ 中断', key: 'stop', style: 2 },
-          { text: '📝 Plan', key: 'plan_mode', style: 1 },
-          { text: '💻 Code', key: 'code_mode', style: 1 },
+          { text: '新建', key: 'new_session', style: 2 },
+          { text: '中断', key: 'stop', style: 2 },
+          { text: 'Plan', key: 'plan_mode', style: 1 },
+          { text: 'Code', key: 'code_mode', style: 1 },
         ],
-        task_id: `status_${Date.now()}`,
+        task_id: `s_${Date.now()}`,
       });
     } catch (e) {
-      await this._replyText(frame, `会话: ${session.id}\n状态: ${session.phase}\n消息: ${session.history.length} 条`);
+      await this._replyText(frame, `${emoji[session.phase] || '❓'} ${session.id} | ${session.phase} | ${session.history.length}条`);
     }
   }
 
