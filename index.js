@@ -45,8 +45,19 @@ registry.startAll().then(() => {
 
 function shutdown() {
   log('server', 'Shutting down...');
+  for (const [id, session] of store.sessions) {
+    try { session.destroy(); } catch (_) {}
+  }
   registry.stopAll().then(() => process.exit(0));
 }
 
 process.on('SIGINT', shutdown);
 if (!IS_WIN) process.on('SIGTERM', shutdown);
+
+process.on('exit', () => {
+  for (const [id, session] of store.sessions) {
+    if (session.agent && session.agent.alive) {
+      try { session.agent.kill(); } catch (_) {}
+    }
+  }
+});
