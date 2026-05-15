@@ -7,6 +7,10 @@ const { RichRenderer } = require('./src/interaction');
 const { log } = require('./src/shared/logger');
 const { IS_WIN } = require('./src/shared/platform');
 
+process.on('unhandledRejection', (reason) => {
+  log('server', `Unhandled rejection: ${reason?.message || JSON.stringify(reason)}`);
+});
+
 const store = new SessionStore();
 store.restore();
 

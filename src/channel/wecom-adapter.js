@@ -103,9 +103,9 @@ class WeComAdapter extends BaseAdapter {
 
   _onEnterChat(frame) {
     this.wsClient.replyWelcome(frame, {
-      msgtype: 'markdown',
-      markdown: { content: '👋 你好！我是 **Claude AI 助手**\n\n直接发送消息即可对话。`/help` 查看命令列表。' },
-    });
+      msgtype: 'text',
+      text: { content: '你好！我是 Claude AI 助手，直接发消息即可对话。/help 查看命令。' },
+    }).catch(e => log('wecom', `Welcome error: ${e.message || JSON.stringify(e)}`));
   }
 
   async _onText(frame) {
