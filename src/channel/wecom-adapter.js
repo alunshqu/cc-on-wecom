@@ -218,6 +218,24 @@ class WeComAdapter extends BaseAdapter {
     const userId = frame.body?.from?.userid || 'unknown';
     const session = this._getUserSession(userId);
 
+    // Interactive prompt responses
+    if (key === 'interactive_approve') {
+      session.sendMessage('确认');
+      await this._replyText(frame, '✅').catch(() => {});
+      return;
+    }
+    if (key === 'interactive_deny') {
+      session.sendMessage('取消');
+      await this._replyText(frame, '❌').catch(() => {});
+      return;
+    }
+    if (key.startsWith('interactive_opt_')) {
+      const num = key.replace('interactive_opt_', '');
+      session.sendMessage(num);
+      await this._replyText(frame, `已选 ${num}`).catch(() => {});
+      return;
+    }
+
     switch (key) {
       case 'new_session': {
         const id = `wecom_${userId.slice(-6)}_${Date.now().toString(36)}`;
@@ -295,7 +313,6 @@ class WeComAdapter extends BaseAdapter {
     const userId = frame.body?.from?.userid;
     const streamId = generateReqId('stream');
 
-    // Immediately ack with replyStream (within req_id validity window)
     try { await this.wsClient.replyStream(frame, streamId, '⏳ 收到，处理中...', true); } catch (_) {}
 
     if (session.phase !== 'idle' && session.phase !== 'awaiting_input') {
@@ -306,7 +323,15 @@ class WeComAdapter extends BaseAdapter {
       }
     }
 
+    // Listen for interactive prompt (multi-step questions)
+    const onInteractive = async ({ state, response, message }) => {
+      session.removeListener('interactive-prompt', onInteractive);
+      await this._sendInteractiveCard(userId, state, message);
+    };
+    session.once('interactive-prompt', onInteractive);
+
     session.sendMessage(text, async (response) => {
+      session.removeListener('interactive-prompt', onInteractive);
       if (response) {
         const condensed = this._condenseResponse(response);
         const chunks = this._splitResponse(condensed, 18000);
@@ -317,6 +342,46 @@ class WeComAdapter extends BaseAdapter {
         await this.send(userId, '⚠️ 未提取到响应，请重试');
       }
     });
+  }
+
+  async _sendInteractiveCard(userId, state, fallbackMessage) {
+    if (!this.wsClient) return;
+
+    const buttons = [];
+    if (state.type === 'permission') {
+      buttons.push({ text: '✅ 允许', key: 'interactive_approve', style: 2 });
+      buttons.push({ text: '❌ 拒绝', key: 'interactive_deny', style: 2 });
+    } else if (state.type === 'confirm') {
+      buttons.push({ text: '确认', key: 'interactive_approve', style: 2 });
+      buttons.push({ text: '取消', key: 'interactive_deny', style: 2 });
+    } else if (state.type === 'select' && state.options.length) {
+      state.options.slice(0, 6).forEach((opt, i) => {
+        buttons.push({ text: opt.length > 12 ? opt.substring(0, 11) + '…' : opt, key: `interactive_opt_${i + 1}`, style: 1 });
+      });
+    }
+
+    if (buttons.length) {
+      try {
+        await this.wsClient.sendMessage(userId, {
+          msgtype: 'template_card',
+          template_card: {
+            card_type: 'button_interaction',
+            main_title: { title: state.prompt || '需要你的输入' },
+            sub_title_text: state.type === 'select'
+              ? state.options.map((o, i) => `${i + 1}. ${o}`).join('\n')
+              : '',
+            button_list: buttons,
+            task_id: `interact_${Date.now()}`,
+          },
+        });
+        return;
+      } catch (e) {
+        log('wecom', `Interactive card failed: ${e.message}`);
+      }
+    }
+
+    // Fallback to text
+    await this.send(userId, fallbackMessage);
   }
 
   _condenseResponse(text) {
