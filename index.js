@@ -25,11 +25,11 @@ registry.register(wecomAdapter);
 registry.startAll().then(() => {
   log('server', `cc-on-wecom started. Channels: ${[...registry.adapters.keys()].join(', ')}`);
 
-  // Restore persisted sessions and start them
   for (const [id, session] of store.sessions) {
-    if (session.phase === 'init') {
+    if (id === 'wecom_warmup') continue;
+    if (!session.agent.alive) {
       session.start();
-      webAdapter._bindSession(session);
+      log('server', `Started restored session: ${id}`);
     }
   }
 }).catch((e) => {

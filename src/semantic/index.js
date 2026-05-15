@@ -93,6 +93,10 @@ class SemanticSession extends EventEmitter {
       this.stateMachine.tick();
     });
 
+    this.agent.on('screen-change', ({ screenType }) => {
+      this.stateMachine.tick();
+    });
+
     this.agent.on('exit', ({ exitCode }) => {
       this._log(`Agent exited code=${exitCode}`);
       const resumeFailed = this.agent.spawnUsedResume && this.phase === AgentState.INIT && exitCode !== 0;
