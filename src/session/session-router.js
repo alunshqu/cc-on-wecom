@@ -12,7 +12,7 @@ class SessionRouter {
 
     if (!session) {
       const id = `${channelId}_${userId.slice(-6)}`;
-      session = this.store.create(id, { cwd: process.env.HOME });
+      session = this.store.create(id, { cwd: require('../shared/platform').homedir() });
       this.store.setUserSession(userId, id);
       session.start();
       log('router', `Created session ${id} for user ${userId}`);

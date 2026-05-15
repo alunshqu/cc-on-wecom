@@ -3,13 +3,14 @@ const path = require('path');
 const { SemanticSession } = require('../semantic');
 const { log } = require('../shared/logger');
 const config = require('../shared/config');
+const { IS_WIN } = require('../shared/platform');
 
 const STATE_DIR = config.paths.statePath;
 const SESSION_DIR = path.join(STATE_DIR, 'sessions');
 const WECOM_MAP_FILE = path.join(STATE_DIR, 'wecom-user-sessions.json');
 
 function ensureStateDir() {
-  fs.mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(SESSION_DIR, { recursive: true, ...(IS_WIN ? {} : { mode: 0o700 }) });
 }
 
 function safeName(id) {
@@ -17,11 +18,11 @@ function safeName(id) {
 }
 
 function atomicWriteJson(filePath, value) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, ...(IS_WIN ? {} : { mode: 0o700 }) });
   const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), { mode: 0o600 });
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), IS_WIN ? {} : { mode: 0o600 });
   fs.renameSync(tmp, filePath);
-  try { fs.chmodSync(filePath, 0o600); } catch (_) {}
+  if (!IS_WIN) { try { fs.chmodSync(filePath, 0o600); } catch (_) {} }
 }
 
 class SessionStore {
@@ -41,7 +42,7 @@ class SessionStore {
   create(id, options = {}) {
     const session = new SemanticSession({
       id,
-      cwd: options.cwd || process.env.HOME,
+      cwd: options.cwd || require('../shared/platform').homedir(),
       claudePath: config.claude.path,
       claudeSessionId: options.claudeSessionId || null,
       history: options.history || [],

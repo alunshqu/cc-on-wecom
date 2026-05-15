@@ -4,13 +4,14 @@ const { ClaudeAgent } = require('../cli-agent');
 const StateMachine = require('./state-machine');
 const { extractResponse } = require('./response-extractor');
 const { parseInteractiveState, formatInteractivePrompt, normalizeInteractiveInput } = require('./prompt-detector');
+const { homedir } = require('../shared/platform');
 const { log: defaultLog } = require('../shared/logger');
 
 class SemanticSession extends EventEmitter {
   constructor(options = {}) {
     super();
     this.id = options.id || `session_${Date.now().toString(36)}`;
-    this.cwd = options.cwd || process.env.HOME;
+    this.cwd = options.cwd || homedir();
     this.phase = AgentState.INIT;
     this.status = 'starting';
     this.history = options.history || [];

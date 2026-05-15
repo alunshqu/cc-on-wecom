@@ -1,8 +1,9 @@
 const path = require('path');
+const { defaultClaudePath, homedir } = require('./platform');
 
 module.exports = {
   claude: {
-    path: process.env.CLAUDE_PATH || '/usr/local/bin/claude',
+    path: process.env.CLAUDE_PATH || defaultClaudePath(),
     args: ['--permission-mode', 'bypassPermissions'],
   },
   server: {

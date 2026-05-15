@@ -1,9 +1,11 @@
 require('dotenv').config();
 
+const os = require('os');
 const SessionStore = require('./src/session/session-store');
 const { WebAdapter, WeComAdapter, ChannelRegistry } = require('./src/channel');
 const { RichRenderer } = require('./src/interaction');
 const { log } = require('./src/shared/logger');
+const { IS_WIN } = require('./src/shared/platform');
 
 const store = new SessionStore();
 store.restore();
@@ -23,7 +25,7 @@ const wecomAdapter = new WeComAdapter({
 registry.register(wecomAdapter);
 
 registry.startAll().then(() => {
-  log('server', `cc-on-wecom started. Channels: ${[...registry.adapters.keys()].join(', ')}`);
+  log('server', `cc-on-wecom started on ${process.platform}/${os.arch()} (Node ${process.version}). Channels: ${[...registry.adapters.keys()].join(', ')}`);
 
   for (const [id, session] of store.sessions) {
     if (id === 'wecom_warmup') continue;
@@ -37,12 +39,10 @@ registry.startAll().then(() => {
   process.exit(1);
 });
 
-process.on('SIGINT', () => {
+function shutdown() {
   log('server', 'Shutting down...');
   registry.stopAll().then(() => process.exit(0));
-});
+}
 
-process.on('SIGTERM', () => {
-  log('server', 'Shutting down...');
-  registry.stopAll().then(() => process.exit(0));
-});
+process.on('SIGINT', shutdown);
+if (!IS_WIN) process.on('SIGTERM', shutdown);

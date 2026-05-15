@@ -2,14 +2,15 @@ const EventEmitter = require('events');
 const pty = require('node-pty');
 const { execSync } = require('child_process');
 const { createTerminal, getScreenText, getScreenLines, getViewportLines, detectScreenType, COLS, ROWS } = require('./screen-parser');
+const { IS_WIN, homedir, shellEnv } = require('../shared/platform');
 
 class PtyProcess extends EventEmitter {
   constructor(options = {}) {
     super();
-    this.claudePath = options.claudePath || process.env.CLAUDE_PATH || '/usr/local/bin/claude';
-    this.cwd = options.cwd || process.env.HOME;
+    this.claudePath = options.claudePath || process.env.CLAUDE_PATH || (IS_WIN ? 'claude.cmd' : '/usr/local/bin/claude');
+    this.cwd = options.cwd || homedir();
     this.claudeArgs = options.claudeArgs || ['--permission-mode', 'bypassPermissions'];
-    this.env = { ...process.env, TERM: 'xterm-256color', ...(options.env || {}) };
+    this.env = { ...shellEnv(), ...(options.env || {}) };
 
     this.proc = null;
     this.vt = null;
@@ -137,7 +138,7 @@ class PtyProcess extends EventEmitter {
   isProcessAlive() {
     if (!this.pid) return false;
     try {
-      execSync(`kill -0 ${this.pid}`, { timeout: 2000 });
+      process.kill(this.pid, 0);
       return true;
     } catch (_) {
       return false;
@@ -147,18 +148,30 @@ class PtyProcess extends EventEmitter {
   getProcessDiagnostics() {
     if (!this.pid) return { alive: false };
     const diag = { alive: this.isProcessAlive(), pid: this.pid };
-    try {
-      diag.connections = parseInt(execSync(
-        `lsof -i -p ${this.pid} 2>/dev/null | grep -c ESTABLISHED`,
-        { encoding: 'utf8', timeout: 2000 }
-      ).trim()) || 0;
-    } catch (_) { diag.connections = 0; }
-    try {
-      diag.cpu = parseFloat(execSync(
-        `ps -o %cpu -p ${this.pid} | tail -1`,
-        { encoding: 'utf8', timeout: 2000 }
-      ).trim()) || 0;
-    } catch (_) { diag.cpu = 0; }
+    if (IS_WIN) {
+      try {
+        const out = execSync(
+          `tasklist /FI "PID eq ${this.pid}" /FO CSV /NH`,
+          { encoding: 'utf8', timeout: 3000 }
+        ).trim();
+        diag.running = !out.includes('No tasks');
+      } catch (_) { diag.running = false; }
+      diag.connections = 0;
+      diag.cpu = 0;
+    } else {
+      try {
+        diag.connections = parseInt(execSync(
+          `lsof -i -p ${this.pid} 2>/dev/null | grep -c ESTABLISHED`,
+          { encoding: 'utf8', timeout: 2000 }
+        ).trim()) || 0;
+      } catch (_) { diag.connections = 0; }
+      try {
+        diag.cpu = parseFloat(execSync(
+          `ps -o %cpu -p ${this.pid} | tail -1`,
+          { encoding: 'utf8', timeout: 2000 }
+        ).trim()) || 0;
+      } catch (_) { diag.cpu = 0; }
+    }
     return diag;
   }
 

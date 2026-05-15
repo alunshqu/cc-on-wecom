@@ -56,7 +56,7 @@ class WeComAdapter extends BaseAdapter {
 
   _warmUp() {
     const id = 'wecom_warmup';
-    this._warmSession = this.store.create(id, { cwd: process.env.HOME });
+    this._warmSession = this.store.create(id, { cwd: require('../shared/platform').homedir() });
     this._warmSession.start();
     log('wecom', 'Pre-warming Claude session...');
   }
@@ -78,7 +78,7 @@ class WeComAdapter extends BaseAdapter {
     }
 
     const id = `wecom_${userId.slice(-6)}`;
-    session = this.store.create(id, { cwd: process.env.HOME });
+    session = this.store.create(id, { cwd: require('../shared/platform').homedir() });
     this.store.setUserSession(userId, id);
     session.start();
     log('wecom', `Created session ${id} for user ${userId}`);
@@ -207,7 +207,7 @@ class WeComAdapter extends BaseAdapter {
     switch (key) {
       case 'new_session': {
         const id = `wecom_${userId.slice(-6)}_${Date.now().toString(36)}`;
-        const newSession = this.store.create(id, { cwd: process.env.HOME });
+        const newSession = this.store.create(id, { cwd: require('../shared/platform').homedir() });
         this.store.setUserSession(userId, id);
         newSession.start();
         await this._replyText(frame, `✅ 新会话 ${id}`);
@@ -237,7 +237,7 @@ class WeComAdapter extends BaseAdapter {
     switch (cmd) {
       case '/new': {
         const id = `wecom_${userId.slice(-6)}_${Date.now().toString(36)}`;
-        const newSession = this.store.create(id, { cwd: process.env.HOME });
+        const newSession = this.store.create(id, { cwd: require('../shared/platform').homedir() });
         this.store.setUserSession(userId, id);
         newSession.start();
         await this._replyText(frame, `✅ 新会话 ${id}`);

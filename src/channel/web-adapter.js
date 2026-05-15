@@ -94,7 +94,7 @@ class WebAdapter extends BaseAdapter {
     switch (msg.type) {
       case 'create_session': {
         const id = `web_${Date.now().toString(36)}`;
-        const session = this.store.create(id, { cwd: msg.cwd || process.env.HOME });
+        const session = this.store.create(id, { cwd: msg.cwd || require('../shared/platform').homedir() });
         session.start();
         this._bindSession(session);
         meta.sessionId = id;
