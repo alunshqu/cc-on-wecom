@@ -6,6 +6,18 @@ const BaseAdapter = require('./base-adapter');
 const { log } = require('../shared/logger');
 const config = require('../shared/config');
 
+const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+
+function createSdkLogger(level) {
+  const threshold = LOG_LEVELS[level] || LOG_LEVELS.info;
+  return {
+    debug(msg, ...args) { if (threshold <= 0) log('sdk', msg); },
+    info(msg, ...args) { if (threshold <= 1) log('sdk', msg); },
+    warn(msg, ...args) { if (threshold <= 2) log('sdk', `WARN: ${msg}`); },
+    error(msg, ...args) { log('sdk', `ERROR: ${msg}`); },
+  };
+}
+
 class WeComAdapter extends BaseAdapter {
   constructor(options = {}) {
     super({ name: 'wecom', renderer: options.renderer });
@@ -23,11 +35,13 @@ class WeComAdapter extends BaseAdapter {
       return;
     }
 
+    const sdkLogLevel = config.wecom.logLevel || 'info';
     this.wsClient = new WSClient({
       botId: this.botId,
       secret: this.botSecret,
       reconnectInterval: 2000,
       maxReconnectAttempts: -1,
+      logger: createSdkLogger(sdkLogLevel),
     });
 
     this._bindEvents();

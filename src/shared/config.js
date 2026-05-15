@@ -12,6 +12,7 @@ module.exports = {
   wecom: {
     botId: process.env.WECOM_BOT_ID,
     botSecret: process.env.WECOM_BOT_SECRET,
+    logLevel: process.env.WECOM_LOG_LEVEL || 'info',
   },
   paths: {
     uploads: path.join(__dirname, '..', '..', 'uploads'),
