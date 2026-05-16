@@ -103,7 +103,10 @@ class WeComAdapter extends BaseAdapter {
     const ws = this.wsClient;
     ws.on('authenticated', () => log('wecom', 'Authenticated'));
     ws.on('connected', () => log('wecom', 'Connected'));
-    ws.on('disconnected', (r) => log('wecom', `Disconnected: ${r}`));
+    ws.on('disconnected', (reason) => {
+      log('wecom', `Disconnected: ${reason}`);
+      this._scheduleReconnect();
+    });
     ws.on('error', (e) => log('wecom', `Error: ${e.message}`));
 
     ws.on('event.enter_chat', (frame) => this._onEnterChat(frame));
@@ -113,6 +116,17 @@ class WeComAdapter extends BaseAdapter {
     ws.on('message.file', (frame) => this._onFile(frame));
     ws.on('message.mixed', (frame) => this._onMixed(frame));
     ws.on('event.template_card_event', (frame) => this._onCardEvent(frame));
+  }
+
+  _scheduleReconnect() {
+    if (this._reconnectTimer) return;
+    const delay = 5000;
+    log('wecom', `Scheduling reconnect in ${delay}ms...`);
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      log('wecom', 'Reconnecting...');
+      this.wsClient.connect();
+    }, delay);
   }
 
   _onEnterChat(frame) {
@@ -220,18 +234,30 @@ class WeComAdapter extends BaseAdapter {
 
     // Interactive prompt responses
     if (key === 'interactive_approve') {
-      session.sendMessage('确认');
+      session.sendMessage('确认', async (response) => {
+        if (response) await this.send(userId, this._condenseResponse(response));
+      });
       await this._replyText(frame, '✅').catch(() => {});
       return;
     }
     if (key === 'interactive_deny') {
-      session.sendMessage('取消');
+      session.sendMessage('取消', async (response) => {
+        if (response) await this.send(userId, this._condenseResponse(response));
+      });
       await this._replyText(frame, '❌').catch(() => {});
       return;
     }
     if (key.startsWith('interactive_opt_')) {
       const num = key.replace('interactive_opt_', '');
-      session.sendMessage(num);
+      const onInteractive = async ({ state, message }) => {
+        session.removeListener('interactive-prompt', onInteractive);
+        await this._sendInteractiveCard(userId, state, message);
+      };
+      session.once('interactive-prompt', onInteractive);
+      session.sendMessage(num, async (response) => {
+        session.removeListener('interactive-prompt', onInteractive);
+        if (response) await this.send(userId, this._condenseResponse(response));
+      });
       await this._replyText(frame, `已选 ${num}`).catch(() => {});
       return;
     }
@@ -267,6 +293,16 @@ class WeComAdapter extends BaseAdapter {
     }
 
     switch (cmd) {
+      case '/testcard': {
+        await this._replyText(frame, '发送测试卡片...');
+        await this._sendInteractiveCard(userId, {
+          type: 'select',
+          prompt: '测试：选择一个方案',
+          options: ['方案A：微服务', '方案B：单体优化', '方案C：事件驱动'],
+          selected: null,
+        }, '测试卡片');
+        break;
+      }
       case '/new': {
         const id = `wecom_${userId.slice(-6)}_${Date.now().toString(36)}`;
         const newSession = this.store.create(id, { cwd: require('../shared/platform').homedir() });

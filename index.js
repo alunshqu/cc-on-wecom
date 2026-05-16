@@ -52,7 +52,10 @@ function shutdown() {
 }
 
 process.on('SIGINT', shutdown);
-if (!IS_WIN) process.on('SIGTERM', shutdown);
+if (!IS_WIN) {
+  process.on('SIGTERM', () => log('server', 'Received SIGTERM (ignored)'));
+  process.on('SIGHUP', () => log('server', 'Received SIGHUP (ignored)'));
+}
 
 process.on('exit', () => {
   for (const [id, session] of store.sessions) {
