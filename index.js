@@ -38,6 +38,7 @@ registry.startAll().then(() => {
       log('server', `Started restored session: ${id}`);
     }
   }
+  webAdapter.bindAllSessions();
 }).catch((e) => {
   log('server', `Startup failed: ${e.message}`);
   process.exit(1);

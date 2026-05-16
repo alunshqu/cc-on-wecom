@@ -6,6 +6,7 @@ const { extractResponse } = require('./response-extractor');
 const { parseInteractiveState, formatInteractivePrompt, normalizeInteractiveInput } = require('./prompt-detector');
 const { homedir } = require('../shared/platform');
 const { log: defaultLog } = require('../shared/logger');
+const config = require('../shared/config');
 
 class SemanticSession extends EventEmitter {
   constructor(options = {}) {
@@ -22,6 +23,8 @@ class SemanticSession extends EventEmitter {
     this.currentRequest = null;
     this.pendingCallbacks = [];
     this._messageQueue = [];
+    this._maintenanceQueued = null;
+    this._turnsSinceContextCheck = 0;
     this._log = options.log || ((msg) => defaultLog(this.id, msg));
 
     this.agent = new ClaudeAgent({
@@ -192,7 +195,72 @@ class SemanticSession extends EventEmitter {
 
     this.emit('state-change', { from: prev, to: AgentState.IDLE });
     this.emit('response-complete', { text: response, reason });
-    setTimeout(() => this._drainQueue(), 500);
+    setTimeout(() => {
+      this._maybeContextMaintenance();
+      this._drainQueue();
+    }, 500);
+  }
+
+  _maybeContextMaintenance() {
+    if (this.phase !== AgentState.IDLE || this._maintenanceQueued) return;
+    if (!this.history.some(e => e.role === 'user')) return;
+
+    this._turnsSinceContextCheck++;
+    const ctx = this.context;
+
+    if (ctx.needsCompact) {
+      this._enqueueInternal('/compact', 'compact');
+      return;
+    }
+
+    const staleMs = config.context.checkStaleMs || 600000;
+    const everyTurns = config.context.checkEveryTurns || 6;
+    const lastChecked = ctx.lastCheckedAt || 0;
+
+    if (this._turnsSinceContextCheck >= everyTurns || (Date.now() - lastChecked >= staleMs)) {
+      this._enqueueInternal('/context', 'context_check');
+    }
+  }
+
+  _enqueueInternal(text, kind) {
+    this._maintenanceQueued = kind;
+    this._messageQueue.unshift({
+      text,
+      onComplete: (response) => {
+        this._maintenanceQueued = null;
+        if (kind === 'context_check') {
+          this._parseContextFromResponse(response);
+        } else if (kind === 'compact') {
+          this.context = { ...this.context, needsCompact: false, lastCompactedAt: Date.now() };
+          this._log('Context compacted');
+        }
+      },
+      options: { internal: true, persistHistory: false, kind },
+    });
+    if (this.phase === AgentState.IDLE) this._drainQueue();
+  }
+
+  _parseContextFromResponse(text) {
+    if (!text) return;
+    const match = text.match(/([\d.,]+)\s*([kKmM]?)\s*\/\s*([\d.,]+)\s*([kKmM]?)/);
+    if (match) {
+      const parse = (v, u) => {
+        const n = parseFloat(String(v).replace(/,/g, ''));
+        if (u === 'm' || u === 'M') return n * 1000000;
+        if (u === 'k' || u === 'K') return n * 1000;
+        return n;
+      };
+      const used = parse(match[1], match[2]);
+      const total = parse(match[3], match[4]);
+      const percent = used / total;
+      const threshold = config.context.compactThreshold || 0.85;
+      const cooldown = config.context.compactCooldownMs || 300000;
+      const needsCompact = percent >= threshold && (Date.now() - (this.context.lastCompactedAt || 0) >= cooldown);
+      this.context = { ...this.context, usedTokens: used, maxTokens: total, percent, needsCompact, lastCheckedAt: Date.now() };
+      this._turnsSinceContextCheck = 0;
+      this._log(`Context: ${Math.round(percent * 100)}%${needsCompact ? ' (will compact)' : ''}`);
+      this.emit('context-usage', this.context);
+    }
   }
 
   _sendNow(text, onComplete, options = {}) {

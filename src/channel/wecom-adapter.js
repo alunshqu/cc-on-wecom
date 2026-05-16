@@ -3,6 +3,7 @@ const path = require('path');
 const AiBot = require('@wecom/aibot-node-sdk');
 const { WSClient, generateReqId } = AiBot;
 const BaseAdapter = require('./base-adapter');
+const { handleCommand } = require('./wecom-commands');
 const { log } = require('../shared/logger');
 const config = require('../shared/config');
 
@@ -58,13 +59,16 @@ class WeComAdapter extends BaseAdapter {
   async send(userId, message) {
     if (!this.wsClient) return;
     const content = typeof message === 'string' ? message : message.content;
-    try {
-      await this.wsClient.sendMessage(userId, {
-        msgtype: 'markdown',
-        markdown: { content },
-      });
-    } catch (e) {
-      log('wecom', `sendMessage to ${userId} failed: ${e.message}`);
+    const body = { msgtype: 'markdown', markdown: { content } };
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await this.wsClient.sendMessage(userId, body);
+        return;
+      } catch (e) {
+        log('wecom', `sendMessage attempt ${attempt + 1} failed: ${e.message || JSON.stringify(e)}`);
+        if (attempt < 2) await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
+      }
     }
   }
 
@@ -282,62 +286,7 @@ class WeComAdapter extends BaseAdapter {
   }
 
   async _handleCommand(frame, userId, text) {
-    const parts = text.trim().split(/\s+/);
-    const cmd = parts[0].toLowerCase();
-    const session = this._getUserSession(userId);
-
-    const cliCommands = ['/context', '/compact', '/model', '/plan', '/code', '/init', '/skills'];
-    if (cliCommands.includes(cmd)) {
-      await this._sendToClaudeStream(frame, session, cmd);
-      return;
-    }
-
-    switch (cmd) {
-      case '/testcard': {
-        await this._replyText(frame, '发送测试卡片...');
-        await this._sendInteractiveCard(userId, {
-          type: 'select',
-          prompt: '测试：选择一个方案',
-          options: ['方案A：微服务', '方案B：单体优化', '方案C：事件驱动'],
-          selected: null,
-        }, '测试卡片');
-        break;
-      }
-      case '/new': {
-        const id = `wecom_${userId.slice(-6)}_${Date.now().toString(36)}`;
-        const newSession = this.store.create(id, { cwd: require('../shared/platform').homedir() });
-        this.store.setUserSession(userId, id);
-        newSession.start();
-        await this._replyText(frame, `✅ 新会话 ${id}`);
-        break;
-      }
-      case '/sessions': {
-        const list = this.store.list();
-        if (!list.length) { await this._replyText(frame, '暂无活跃会话'); break; }
-        const lines = list.map(s => `• \`${s.id}\` ${s.status} (${s.messageCount}条)`);
-        await this._replyText(frame, lines.join('\n'));
-        break;
-      }
-      case '/stop': {
-        session.sendKey('ctrl+c');
-        await this._replyText(frame, '⏹ 已中断');
-        break;
-      }
-      case '/status': {
-        await this._sendStatusCard(frame, session);
-        break;
-      }
-      case '/help': {
-        await this._replyText(frame, [
-          '`/context` 上下文 | `/compact` 压缩 | `/model` 模型',
-          '`/plan` 计划 | `/code` 代码 | `/stop` 中断',
-          '`/new` 新建 | `/sessions` 列表 | `/status` 状态',
-        ].join('\n'));
-        break;
-      }
-      default:
-        await this._replyText(frame, `未知命令 \`${cmd}\`，发 /help 查看`);
-    }
+    await handleCommand(this, frame, userId, text);
   }
 
   async _handleMessage(frame, userId, text) {

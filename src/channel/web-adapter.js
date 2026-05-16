@@ -63,6 +63,21 @@ class WebAdapter extends BaseAdapter {
       }
       return;
     }
+    if (req.url === '/health') {
+      const sessions = this.store.list();
+      const health = {
+        status: 'ok',
+        uptime: Math.round(process.uptime()),
+        platform: process.platform,
+        sessions: sessions.length,
+        activeSessions: sessions.filter(s => s.status === 'idle' || s.status === 'processing').length,
+        wsClients: this._clients.size,
+        memory: Math.round(process.memoryUsage().rss / 1024 / 1024) + 'MB',
+      };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(health));
+      return;
+    }
     if (req.url === '/upload' && req.method === 'POST') {
       this._handleUpload(req, res);
       return;
@@ -134,6 +149,8 @@ class WebAdapter extends BaseAdapter {
   }
 
   _bindSession(session) {
+    if (session._webBound) return;
+    session._webBound = true;
     session.on('user-message', (entry) => {
       this.broadcast(session.id, { type: 'message', ...entry, sessionId: session.id });
     });
@@ -145,6 +162,12 @@ class WebAdapter extends BaseAdapter {
       this.broadcast(session.id, { type: 'status', status, sessionId: session.id });
       this.broadcastAll({ type: 'sessions', sessions: this.store.list() });
     });
+  }
+
+  bindAllSessions() {
+    for (const [id, session] of this.store.sessions) {
+      this._bindSession(session);
+    }
   }
 
   _handleUpload(req, res) {
