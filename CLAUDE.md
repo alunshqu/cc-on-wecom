@@ -26,3 +26,20 @@ npm start
 ```
 
 Service listens on port 8890 (HTTP + WebSocket for web UI, WeCom bot via SDK).
+
+## Sending Files/Images to WeCom Users
+
+When you need to send a file or image back to the WeCom user, use the local HTTP API instead of mentioning the file path in your response:
+
+```bash
+curl -s -X POST http://localhost:8890/api/wecom/send-file \
+  -H 'Content-Type: application/json' \
+  -d '{"userId": "<WECOM_USER_ID>", "filePath": "<ABSOLUTE_PATH>"}'
+```
+
+- `userId`: the WeCom user ID of the current conversation (provided in context when available)
+- `filePath`: absolute path to the file on disk (image or any file type)
+- The API auto-detects image vs file type based on extension
+- Returns `{"ok": true}` on success
+
+**Always use this API to send files/images. Do not just mention file paths in text — the user cannot access the server filesystem.**

@@ -16,17 +16,18 @@ store.restore();
 
 const registry = new ChannelRegistry();
 
-const webAdapter = new WebAdapter({
-  store,
-  renderer: new RichRenderer(),
-});
-registry.register(webAdapter);
-
 const wecomAdapter = new WeComAdapter({
   store,
   renderer: new RichRenderer(),
 });
 registry.register(wecomAdapter);
+
+const webAdapter = new WebAdapter({
+  store,
+  renderer: new RichRenderer(),
+  wecomAdapter,
+});
+registry.register(webAdapter);
 
 registry.startAll().then(() => {
   log('server', `cc-on-wecom started on ${process.platform}/${os.arch()} (Node ${process.version}). Channels: ${[...registry.adapters.keys()].join(', ')}`);

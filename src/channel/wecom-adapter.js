@@ -337,7 +337,10 @@ class WeComAdapter extends BaseAdapter {
     };
     session.once('interactive-prompt', onInteractive);
 
-    session.sendMessage(text, async (response) => {
+    // 在消息前注入 userId，让 Claude 知道当前用户是谁（用于调用 send-file API）
+    const msgWithContext = `[WECOM_USER_ID: ${userId}]\n${text}`;
+
+    session.sendMessage(msgWithContext, async (response) => {
       session.removeListener('interactive-prompt', onInteractive);
       if (response) {
         const condensed = this._condenseResponse(response);

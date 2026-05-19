@@ -12,6 +12,7 @@ class WebAdapter extends BaseAdapter {
     this.port = options.port || config.server.port;
     this.store = options.store;
     this.router = options.router;
+    this.wecomAdapter = options.wecomAdapter || null;
     this.server = null;
     this.wss = null;
     this._clients = new Map();
@@ -80,6 +81,10 @@ class WebAdapter extends BaseAdapter {
     }
     if (req.url === '/upload' && req.method === 'POST') {
       this._handleUpload(req, res);
+      return;
+    }
+    if (req.url === '/api/wecom/send-file' && req.method === 'POST') {
+      this._handleSendFile(req, res);
       return;
     }
     res.writeHead(404);
@@ -182,6 +187,38 @@ class WebAdapter extends BaseAdapter {
       fs.writeFileSync(filePath, body);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ path: filePath }));
+    });
+  }
+
+  _handleSendFile(req, res) {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', async () => {
+      try {
+        const { userId, filePath } = JSON.parse(Buffer.concat(chunks).toString());
+        if (!userId || !filePath) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'userId and filePath are required' }));
+          return;
+        }
+        if (!fs.existsSync(filePath)) {
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `File not found: ${filePath}` }));
+          return;
+        }
+        if (!this.wecomAdapter) {
+          res.writeHead(503, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'WeCom adapter not available' }));
+          return;
+        }
+        await this.wecomAdapter.sendFile(userId, filePath);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        log('web', `send-file error: ${e.message}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      }
     });
   }
 }
