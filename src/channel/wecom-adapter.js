@@ -72,6 +72,28 @@ class WeComAdapter extends BaseAdapter {
     }
   }
 
+  // 上传并发送本地文件（图片或普通文件）
+  async sendFile(userId, filePath) {
+    if (!this.wsClient || !fs.existsSync(filePath)) return;
+    const ext = path.extname(filePath).toLowerCase();
+    const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'];
+    const mediaType = imageExts.includes(ext) ? 'image' : 'file';
+
+    try {
+      const buffer = fs.readFileSync(filePath);
+      const result = await this.wsClient.uploadMedia(buffer, {
+        type: mediaType,
+        filename: path.basename(filePath),
+      });
+      await this.wsClient.sendMediaMessage(userId, mediaType, result.media_id);
+      log('wecom', `Sent ${mediaType} to ${userId}: ${path.basename(filePath)}`);
+    } catch (e) {
+      log('wecom', `sendFile failed for ${filePath}: ${e.message}`);
+      // 降级：发文件路径文本
+      await this.send(userId, `📎 文件已生成：\`${filePath}\``);
+    }
+  }
+
   _warmUp() {
     const id = 'wecom_warmup';
     this._warmSession = this.store.create(id, { cwd: require('../shared/platform').homedir() });
@@ -319,9 +341,20 @@ class WeComAdapter extends BaseAdapter {
       session.removeListener('interactive-prompt', onInteractive);
       if (response) {
         const condensed = this._condenseResponse(response);
-        const chunks = this._splitResponse(condensed, 18000);
-        for (const chunk of chunks) {
-          await this.send(userId, chunk);
+
+        // 检测响应中的本地文件路径，自动上传发送
+        const filePaths = this._extractFilePaths(condensed);
+        const textWithoutPaths = filePaths.length
+          ? this._removeFilePaths(condensed, filePaths)
+          : condensed;
+
+        if (textWithoutPaths.trim()) {
+          const chunks = this._splitResponse(textWithoutPaths, 18000);
+          for (const chunk of chunks) await this.send(userId, chunk);
+        }
+
+        for (const filePath of filePaths) {
+          await this.sendFile(userId, filePath);
         }
       } else {
         await this.send(userId, '⚠️ 未提取到响应，请重试');
@@ -407,6 +440,32 @@ class WeComAdapter extends BaseAdapter {
     }
 
     return condensed.join('\n').trim();
+  }
+
+  // 从文本中提取存在的本地文件路径（图片/文件）
+  _extractFilePaths(text) {
+    const mediaExts = /\.(jpg|jpeg|png|gif|webp|bmp|pdf|docx?|xlsx?|pptx?|zip|tar|gz|csv|txt|md)$/i;
+    // 匹配绝对路径或 ~/... 路径
+    const pathPattern = /(?:^|\s|[`'"])((\/|~\/)[^\s`'">\]）】]+)/gm;
+    const found = [];
+    let m;
+    while ((m = pathPattern.exec(text)) !== null) {
+      const p = m[1].replace(/^~/, require('os').homedir());
+      if (mediaExts.test(p) && fs.existsSync(p) && !found.includes(p)) {
+        found.push(p);
+      }
+    }
+    return found;
+  }
+
+  // 从文本中移除已提取的文件路径行，避免重复展示
+  _removeFilePaths(text, filePaths) {
+    let result = text;
+    for (const p of filePaths) {
+      // 移除包含该路径的整行
+      result = result.split('\n').filter(line => !line.includes(p)).join('\n');
+    }
+    return result.trim();
   }
 
   async _sendStatusCard(frame, session) {
