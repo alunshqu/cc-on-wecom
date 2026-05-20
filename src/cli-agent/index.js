@@ -5,6 +5,7 @@ class ClaudeAgent extends PtyProcess {
   constructor(options = {}) {
     super(options);
     this.claudeSessionId = options.claudeSessionId || null;
+    this.appendSystemPrompt = options.appendSystemPrompt || null;
     this._spawnUsedResume = false;
   }
 
@@ -12,12 +13,15 @@ class ClaudeAgent extends PtyProcess {
     this.claudeSessionId = sessionId;
     this._spawnUsedResume = true;
     const args = sessionId ? ['--resume', sessionId] : [];
+    if (this.appendSystemPrompt) args.push('--append-system-prompt', this.appendSystemPrompt);
     this.spawn(args);
   }
 
   spawnFresh() {
     this._spawnUsedResume = false;
-    this.spawn();
+    const args = [];
+    if (this.appendSystemPrompt) args.push('--append-system-prompt', this.appendSystemPrompt);
+    this.spawn(args);
   }
 
   get spawnUsedResume() {

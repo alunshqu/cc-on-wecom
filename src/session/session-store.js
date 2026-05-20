@@ -47,6 +47,7 @@ class SessionStore {
       claudeSessionId: options.claudeSessionId || null,
       history: options.history || [],
       context: options.context || {},
+      appendSystemPrompt: options.appendSystemPrompt || null,
     });
     this.sessions.set(id, session);
     this._persist(session);

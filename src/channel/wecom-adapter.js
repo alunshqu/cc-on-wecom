@@ -7,6 +7,21 @@ const { handleCommand } = require('./wecom-commands');
 const { log } = require('../shared/logger');
 const config = require('../shared/config');
 
+// 注入到每个 CC session 的 system prompt 追加内容
+// 让 CC 知道它可以生成文件并输出标记，由渠道层负责发送
+const CHANNEL_SYSTEM_PROMPT = `
+You are running inside a messaging gateway. When a user asks you to generate, create, or produce a file (image, chart, diagram, document, PDF, etc.), you CAN do it. Do not refuse.
+
+When you produce a file that should be delivered to the user:
+1. Save it to the session output directory: ${config.paths.uploads}/{sessionId}/out/
+   (Use the actual session ID from your environment, or /tmp/ if unknown)
+2. Output a marker on its own line in your response:
+   [FILE: /absolute/path/to/file.ext]
+3. Do NOT say "I can't send files" — the gateway will handle delivery automatically.
+
+The [FILE: ...] marker is how you hand off files to the channel. The channel (WeCom, Feishu, web, etc.) will pick it up and deliver it appropriately.
+`.trim();
+
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
 
 function createSdkLogger(level) {
@@ -96,7 +111,10 @@ class WeComAdapter extends BaseAdapter {
 
   _warmUp() {
     const id = 'wecom_warmup';
-    this._warmSession = this.store.create(id, { cwd: require('../shared/platform').homedir() });
+    this._warmSession = this.store.create(id, {
+      cwd: require('../shared/platform').homedir(),
+      appendSystemPrompt: CHANNEL_SYSTEM_PROMPT,
+    });
     this._warmSession.start();
     log('wecom', 'Pre-warming Claude session...');
   }
@@ -118,7 +136,10 @@ class WeComAdapter extends BaseAdapter {
     }
 
     const id = `wecom_${userId.slice(-6)}`;
-    session = this.store.create(id, { cwd: require('../shared/platform').homedir() });
+    session = this.store.create(id, {
+      cwd: require('../shared/platform').homedir(),
+      appendSystemPrompt: CHANNEL_SYSTEM_PROMPT,
+    });
     this.store.setUserSession(userId, id);
     session.start();
     log('wecom', `Created session ${id} for user ${userId}`);
@@ -291,7 +312,10 @@ class WeComAdapter extends BaseAdapter {
     switch (key) {
       case 'new_session': {
         const id = `wecom_${userId.slice(-6)}_${Date.now().toString(36)}`;
-        const newSession = this.store.create(id, { cwd: require('../shared/platform').homedir() });
+        const newSession = this.store.create(id, {
+          cwd: require('../shared/platform').homedir(),
+          appendSystemPrompt: CHANNEL_SYSTEM_PROMPT,
+        });
         this.store.setUserSession(userId, id);
         newSession.start();
         await this._replyText(frame, `✅ 新会话 ${id}`);
@@ -337,26 +361,20 @@ class WeComAdapter extends BaseAdapter {
     };
     session.once('interactive-prompt', onInteractive);
 
-    // 在消息前注入 userId，让 Claude 知道当前用户是谁（用于调用 send-file API）
-    const msgWithContext = `[WECOM_USER_ID: ${userId}]\n${text}`;
-
-    session.sendMessage(msgWithContext, async (response) => {
+    session.sendMessage(text, async (response) => {
       session.removeListener('interactive-prompt', onInteractive);
       if (response) {
         const condensed = this._condenseResponse(response);
 
-        // 检测响应中的本地文件路径，自动上传发送
-        const filePaths = this._extractFilePaths(condensed);
-        const textWithoutPaths = filePaths.length
-          ? this._removeFilePaths(condensed, filePaths)
-          : condensed;
+        // 解析 CC 输出的 [FILE: path] 标记，提取并发送文件
+        const { text: textOnly, files } = this._extractFileMarkers(condensed);
 
-        if (textWithoutPaths.trim()) {
-          const chunks = this._splitResponse(textWithoutPaths, 18000);
+        if (textOnly.trim()) {
+          const chunks = this._splitResponse(textOnly, 18000);
           for (const chunk of chunks) await this.send(userId, chunk);
         }
 
-        for (const filePath of filePaths) {
+        for (const filePath of files) {
           await this.sendFile(userId, filePath);
         }
       } else {
@@ -445,30 +463,19 @@ class WeComAdapter extends BaseAdapter {
     return condensed.join('\n').trim();
   }
 
-  // 从文本中提取存在的本地文件路径（图片/文件）
-  _extractFilePaths(text) {
-    const mediaExts = /\.(jpg|jpeg|png|gif|webp|bmp|pdf|docx?|xlsx?|pptx?|zip|tar|gz|csv|txt|md)$/i;
-    // 匹配绝对路径或 ~/... 路径
-    const pathPattern = /(?:^|\s|[`'"])((\/|~\/)[^\s`'">\]）】]+)/gm;
-    const found = [];
-    let m;
-    while ((m = pathPattern.exec(text)) !== null) {
-      const p = m[1].replace(/^~/, require('os').homedir());
-      if (mediaExts.test(p) && fs.existsSync(p) && !found.includes(p)) {
-        found.push(p);
+  // 解析 CC 输出的 [FILE: /path/to/file] 标记
+  // 返回 { text: 去掉标记行的文本, files: [路径数组] }
+  _extractFileMarkers(text) {
+    const files = [];
+    const lines = text.split('\n').filter(line => {
+      const m = line.trim().match(/^\[FILE:\s*(.+?)\s*\]$/);
+      if (m) {
+        files.push(m[1]);
+        return false; // 从文本中移除这行
       }
-    }
-    return found;
-  }
-
-  // 从文本中移除已提取的文件路径行，避免重复展示
-  _removeFilePaths(text, filePaths) {
-    let result = text;
-    for (const p of filePaths) {
-      // 移除包含该路径的整行
-      result = result.split('\n').filter(line => !line.includes(p)).join('\n');
-    }
-    return result.trim();
+      return true;
+    });
+    return { text: lines.join('\n').trim(), files };
   }
 
   async _sendStatusCard(frame, session) {

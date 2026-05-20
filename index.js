@@ -25,7 +25,6 @@ registry.register(wecomAdapter);
 const webAdapter = new WebAdapter({
   store,
   renderer: new RichRenderer(),
-  wecomAdapter,
 });
 registry.register(webAdapter);
 

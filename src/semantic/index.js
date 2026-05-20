@@ -31,6 +31,7 @@ class SemanticSession extends EventEmitter {
       cwd: this.cwd,
       claudePath: options.claudePath,
       claudeSessionId: this.claudeSessionId,
+      appendSystemPrompt: options.appendSystemPrompt || null,
     });
 
     this.stateMachine = new StateMachine(this, {
