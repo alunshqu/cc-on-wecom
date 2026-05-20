@@ -181,7 +181,7 @@ class WebAdapter extends BaseAdapter {
       const filePath = path.join(uploadDir, filename);
       fs.writeFileSync(filePath, body);
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ path: filePath }));
+      res.end(JSON.stringify({ success: true, path: filePath }));
     });
   }
 

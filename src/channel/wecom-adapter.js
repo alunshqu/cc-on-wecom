@@ -10,16 +10,10 @@ const config = require('../shared/config');
 // 注入到每个 CC session 的 system prompt 追加内容
 // 让 CC 知道它可以生成文件并输出标记，由渠道层负责发送
 const CHANNEL_SYSTEM_PROMPT = `
-You are running inside a messaging gateway. When a user asks you to generate, create, or produce a file (image, chart, diagram, document, PDF, etc.), you CAN do it. Do not refuse.
-
-When you produce a file that should be delivered to the user:
-1. Save it to the session output directory: ${config.paths.uploads}/{sessionId}/out/
-   (Use the actual session ID from your environment, or /tmp/ if unknown)
-2. Output a marker on its own line in your response:
-   [FILE: /absolute/path/to/file.ext]
-3. Do NOT say "I can't send files" — the gateway will handle delivery automatically.
-
-The [FILE: ...] marker is how you hand off files to the channel. The channel (WeCom, Feishu, web, etc.) will pick it up and deliver it appropriately.
+You are running inside a messaging gateway that CAN deliver files to users.
+When you save a file (image, screenshot, chart, document, etc.), output this marker on its own line:
+[FILE: /absolute/path/to/file.ext]
+The gateway will automatically deliver it. NEVER say "I can't send files" — just save and mark.
 `.trim();
 
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
@@ -367,7 +361,7 @@ class WeComAdapter extends BaseAdapter {
         const condensed = this._condenseResponse(response);
 
         // 解析 CC 输出的 [FILE: path] 标记，提取并发送文件
-        const { text: textOnly, files } = this._extractFileMarkers(condensed);
+        const { text: textOnly, files } = this._extractFiles(condensed);
 
         if (textOnly.trim()) {
           const chunks = this._splitResponse(textOnly, 18000);
@@ -463,19 +457,33 @@ class WeComAdapter extends BaseAdapter {
     return condensed.join('\n').trim();
   }
 
-  // 解析 CC 输出的 [FILE: /path/to/file] 标记
-  // 返回 { text: 去掉标记行的文本, files: [路径数组] }
-  _extractFileMarkers(text) {
+  _extractFiles(text) {
+    const SENDABLE_EXTS = new Set([
+      '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg',
+      '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.zip', '.tar', '.gz',
+    ]);
     const files = [];
+    const seen = new Set();
+
     const lines = text.split('\n').filter(line => {
       const m = line.trim().match(/^\[FILE:\s*(.+?)\s*\]$/);
-      if (m) {
-        files.push(m[1]);
-        return false; // 从文本中移除这行
-      }
+      if (m) { files.push(m[1]); seen.add(m[1]); return false; }
       return true;
     });
-    return { text: lines.join('\n').trim(), files };
+
+    const remaining = lines.join('\n');
+    const pathMatches = remaining.match(/(?:^|\s|`|'|")(\/[\w./_-]+\.[\w]+)/gm) || [];
+    for (const raw of pathMatches) {
+      const p = raw.trim().replace(/^[`'"]+|[`'"]+$/g, '');
+      if (seen.has(p)) continue;
+      const ext = path.extname(p).toLowerCase();
+      if (!SENDABLE_EXTS.has(ext)) continue;
+      if (!fs.existsSync(p)) continue;
+      seen.add(p);
+      files.push(p);
+    }
+
+    return { text: remaining.trim(), files };
   }
 
   async _sendStatusCard(frame, session) {
