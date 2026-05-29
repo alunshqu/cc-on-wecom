@@ -7,6 +7,31 @@ function cleanInteractiveLine(line) {
     .trim();
 }
 
+const OPTION_NOISE = /^(Submit|Skills|Using|Context Usage|Opus|claude-|esc to|press |enter to)/i;
+
+// Returns the option label for a real menu line, or null if the line is not a
+// selectable option. Only numbered lines (`1.` `2.`) and lines led by a genuine
+// selection marker (cursor / radio / checkbox) count — markdown bullets (`-` `*`)
+// in Claude's prose are intentionally excluded so they aren't mistaken for options.
+function optionText(line) {
+  let m = line.match(/^[❯>→○●◉◯☐☑☒✔✓\s]*(\d+)[.)、]\s+(.+)$/);
+  if (m) {
+    const t = m[2].trim();
+    return OPTION_NOISE.test(t) ? null : t;
+  }
+  m = line.match(/^[❯>→○●◉◯☐☑☒✔✓]\s+([^\s].+)$/);
+  if (m) {
+    const t = m[1].trim();
+    if (OPTION_NOISE.test(t) || t.length > 80 || /[？?]$/.test(t)) return null;
+    return t;
+  }
+  return null;
+}
+
+function isCursorLine(line) {
+  return /^[❯>→]/.test(line);
+}
+
 function parseInteractiveState(vt) {
   const rawLines = getScreenLines(vt).filter(l => l.trim());
   const lines = rawLines.map(cleanInteractiveLine).filter(Boolean);
@@ -27,22 +52,23 @@ function parseInteractiveState(vt) {
     state.type = 'confirm';
   }
 
-  for (const line of tail) {
-    let match = line.match(/^[❯>→\-*•○●◉☐☑✔\s]*(\d+)[.)、]\s+(.+)$/);
-    if (match) {
-      state.options.push(match[2].trim());
-      if (/^[❯>→]/.test(line)) state.selected = state.options.length - 1;
-      continue;
-    }
-    match = line.match(/^[❯>→\-*•○●◉☐☑✔\s]+([^\s].+)$/);
-    if (match && !/^(Submit|Skills|Using|Context Usage)/i.test(match[1])) {
-      const option = match[1].trim();
-      if (option.length <= 80 && !/[？?]$/.test(option)) {
-        state.options.push(option);
-        if (/^[❯>→]/.test(line)) state.selected = state.options.length - 1;
-      }
+  // Collect only the contiguous trailing block of menu options. Scanning the
+  // whole tail caused prose bullet/numbered lists in Claude's answer to be
+  // harvested as fake options. The real menu is always the last run of option
+  // lines, so walk from the bottom up and stop at the first non-option line.
+  const optionLines = [];
+  for (let i = tail.length - 1; i >= 0; i--) {
+    const label = optionText(tail[i]);
+    if (label !== null) {
+      optionLines.unshift({ label, cursor: isCursorLine(tail[i]) });
+    } else if (optionLines.length) {
+      break;
     }
   }
+  optionLines.forEach(({ label, cursor }) => {
+    state.options.push(label);
+    if (cursor) state.selected = state.options.length - 1;
+  });
 
   const promptCandidates = tail.filter(line =>
     !/^←/.test(line) &&

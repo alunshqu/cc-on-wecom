@@ -20,6 +20,7 @@ class SemanticSession extends EventEmitter {
     this.claudeSessionId = options.claudeSessionId || null;
     this.sentTrustEnter = false;
     this.lastExtractedResponse = null;
+    this.interactiveState = null;
     this.currentRequest = null;
     this.pendingCallbacks = [];
     this._messageQueue = [];
@@ -158,6 +159,7 @@ class SemanticSession extends EventEmitter {
     const response = extractResponse(this.agent.vt, this.currentRequest?.text);
     const interactiveState = parseInteractiveState(this.agent.vt);
     const message = formatInteractivePrompt(interactiveState, response);
+    this.interactiveState = interactiveState;
 
     if (response && response !== this.lastExtractedResponse) {
       this.lastExtractedResponse = response;
@@ -175,6 +177,7 @@ class SemanticSession extends EventEmitter {
     const prev = this.phase;
     this.phase = AgentState.IDLE;
     this.status = 'idle';
+    this.interactiveState = null;
     this._log(`Response done (${reason})`);
 
     const request = this.currentRequest || {};
@@ -291,14 +294,50 @@ class SemanticSession extends EventEmitter {
       this.pendingCallbacks.push({ cb: onComplete, internal: request.internal, kind: request.kind });
     }
 
-    const sanitized = request.interactiveReply && normalizeInteractiveInput(text) !== null
-      ? normalizeInteractiveInput(text)
-      : text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
-
-    this.agent.write(sanitized);
-    if (sanitized !== '\r' && sanitized !== '\x1b') {
-      setTimeout(() => { if (this.agent.alive) this.agent.sendEnter(); }, 100);
+    if (request.interactiveReply) {
+      this._deliverInteractiveReply(text);
+      return;
     }
+
+    const sanitized = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
+    this.agent.write(sanitized);
+    setTimeout(() => { if (this.agent.alive) this.agent.sendEnter(); }, 100);
+  }
+
+  // Deliver a reply while Claude is showing an interactive prompt. Confirm/cancel
+  // map to Enter/Escape. A bare option number navigates the menu with arrow keys
+  // and confirms once — typing the digit is unreliable and the old trailing Enter
+  // leaked a stray newline into the next prompt.
+  _deliverInteractiveReply(text) {
+    const control = normalizeInteractiveInput(text);
+    if (control === '\r') { this.agent.sendEnter(); return; }
+    if (control === '\x1b') { this.agent.sendEscape(); return; }
+
+    const state = this.interactiveState;
+    const numMatch = String(text).trim().match(/^(\d+)$/);
+    if (state && state.type === 'select' && state.options.length && numMatch) {
+      const target = parseInt(numMatch[1], 10) - 1;
+      if (target >= 0 && target < state.options.length) {
+        this._navigateAndConfirm(state.selected == null ? 0 : state.selected, target);
+        return;
+      }
+    }
+
+    const sanitized = String(text).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
+    this.agent.write(sanitized);
+    setTimeout(() => { if (this.agent.alive) this.agent.sendEnter(); }, 100);
+  }
+
+  _navigateAndConfirm(from, to) {
+    const delta = to - from;
+    const step = delta > 0 ? () => this.agent.sendArrowDown() : () => this.agent.sendArrowUp();
+    let remaining = Math.abs(delta);
+    const tick = () => {
+      if (!this.agent.alive) return;
+      if (remaining > 0) { step(); remaining--; setTimeout(tick, 40); }
+      else { this.agent.sendEnter(); }
+    };
+    tick();
   }
 
   _drainQueue() {

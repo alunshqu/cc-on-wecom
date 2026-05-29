@@ -89,6 +89,14 @@ class PtyProcess extends EventEmitter {
     return this.write('\x1b');
   }
 
+  sendArrowUp() {
+    return this.write('\x1b[A');
+  }
+
+  sendArrowDown() {
+    return this.write('\x1b[B');
+  }
+
   sendEnter() {
     return this.write('\r');
   }
