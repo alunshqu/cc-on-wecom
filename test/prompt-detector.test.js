@@ -38,6 +38,16 @@ const NUMBERED_MENU = `Which visibility should the repo have?\n\n❯ 1. Public\n
 // Radio menu: ONLY the selected row carries the cursor; siblings are unmarked.
 const RADIO_MENU = `Select a model:\n\n❯ Default (recommended)\n  Opus\n  Sonnet\n\n  Enter to confirm`;
 
+// The main input box with text already typed into it — the exact regression:
+// after a reply, the gateway writes "/context" into the box BEFORE pressing
+// Enter, so the screen briefly shows "❯ /context". This must read as idle, not
+// a selection menu, or every turn looks interactive.
+const INPUT_TYPED = `⏺ Hello! How can I help?\n\n────────────────────────────────────────────\n❯ /context\n────────────────────────────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents       ● high · /effort`;
+
+// A box-drawn empty input after a question. At the SCREEN level this now reads
+// as idle (we no longer treat a lone box as interactive — too many false
+// positives), but parseInteractiveState still classifies it as text_input when
+// asked directly.
 const TEXT_INPUT = `What should the repo be named?\n\n╭──────────────────────────────────────────╮\n│ ❯                                          │\n╰──────────────────────────────────────────╯`;
 
 const PERMISSION = `Claude wants to run: rm -rf build\n\nDo you want to allow this?\n❯ 1. Yes, allow once\n  2. No, deny\n\n  Enter to confirm`;
@@ -60,7 +70,7 @@ const IDLE_V2 = `⏺ Done.\n\n────────────────�
 // ---- detectScreenType ----
 (async () => {
 const S = {};
-for (const [k, v] of Object.entries({ IDLE, IDLE_V2, PROCESSING, NUMBERED_MENU, RADIO_MENU, TEXT_INPUT, PERMISSION, PROSE_TRUST, PROSE_PERMISSION, PROSE_NUMBERED, TRUST })) {
+for (const [k, v] of Object.entries({ IDLE, IDLE_V2, INPUT_TYPED, PROCESSING, NUMBERED_MENU, RADIO_MENU, TEXT_INPUT, PERMISSION, PROSE_TRUST, PROSE_PERMISSION, PROSE_NUMBERED, TRUST })) {
   S[k] = await screen(v);
 }
 
@@ -70,9 +80,16 @@ check('idle v2.1.156 footer', detectScreenType(S.IDLE_V2.text) === 'idle', detec
 check('processing', detectScreenType(S.PROCESSING.text) === 'processing', detectScreenType(S.PROCESSING.text));
 check('numbered menu → interactive', detectScreenType(S.NUMBERED_MENU.text) === 'interactive_prompt', detectScreenType(S.NUMBERED_MENU.text));
 check('radio menu → interactive', detectScreenType(S.RADIO_MENU.text) === 'interactive_prompt', detectScreenType(S.RADIO_MENU.text));
-check('text input → interactive', detectScreenType(S.TEXT_INPUT.text) === 'interactive_prompt', detectScreenType(S.TEXT_INPUT.text));
 check('permission menu → interactive', detectScreenType(S.PERMISSION.text) === 'interactive_prompt', detectScreenType(S.PERMISSION.text));
 check('real trust prompt', detectScreenType(S.TRUST.text) === 'trust_prompt', detectScreenType(S.TRUST.text));
+
+console.log('detectScreenType (must NOT be interactive — the regression):');
+// The input box with text typed into it (e.g. the transient `❯ /context` we
+// write before Enter, or anything the user is typing). Must NOT be a menu.
+check('input box w/ /context typed → idle', detectScreenType(S.INPUT_TYPED.text) === 'idle', detectScreenType(S.INPUT_TYPED.text));
+// The transient box must not be interactive. It resolves to unknown, which the
+// state machine treats as finished (settles to idle) — never as a menu.
+check('bare box → not interactive', detectScreenType(S.TEXT_INPUT.text) !== 'interactive_prompt', detectScreenType(S.TEXT_INPUT.text));
 
 console.log('detectScreenType (prose must NOT be interactive/trust):');
 check('prose trust → not trust_prompt', detectScreenType(S.PROSE_TRUST.text) !== 'trust_prompt', detectScreenType(S.PROSE_TRUST.text));

@@ -43,41 +43,29 @@ function isIdleInputArea(tail) {
   );
 }
 
-// Structural detection of an interactive prompt (selection menu, confirm, or a
-// text-input step inside a prompt) — no keyword whitelist. The reliable signals
-// are a cursor (❯) pointing at a real option, or the footer the CLI renders for
-// arrow-key menus. A bare numbered list is NOT enough: Claude's prose answers
-// often end in "1. … 2. …", and those must not be mistaken for a menu. The idle
-// main input box is explicitly excluded.
+// Structural detection of an interactive prompt (selection menu / confirm).
+// The ONLY reliable signal is the arrow-key-menu shape: a cursor (❯) pointing at
+// a NUMBERED option, or the menu footer the CLI prints ("Enter to confirm",
+// "Esc to cancel", "↑/↓ to select", "← Submit →"). A bare `❯ <text>` is NOT a
+// menu — that is the main input box with text typed into it (including the
+// transient `❯ /context` we write before pressing Enter), and matching it made
+// every normal turn look like a selection. The idle input box is excluded too.
 function isInteractivePrompt(tail) {
   if (isIdleInputArea(tail)) return false;
 
-  // A cursor pointing at a real option (numbered, or a non-empty label).
-  const cursorOnOption = /(^|\n)\s*❯\s*\d+[.)、]\s+\S/m.test(tail) ||
-    /(^|\n)\s*❯\s+\S/m.test(tail);
+  // A cursor pointing at a NUMBERED option, e.g. "❯ 1. Yes". Requires the digit
+  // so the plain input prompt (`❯ something`) can never match.
+  const cursorOnNumbered = /(^|\n)\s*❯\s*\d+[.)、]\s+\S/m.test(tail);
 
   // The footer the CLI prints under arrow-key menus (kept conservative so prose
   // mentioning "Submit"/"select" doesn't trip it).
   const menuFooter = /←.*Submit.*→/.test(tail) ||
     /\b✔\s*Submit\b/.test(tail) ||
     /\bEnter\s+to\s+(confirm|submit|select)\b/i.test(tail) ||
-    /[↑↓].*\bto select\b/i.test(tail) ||
-    (/\besc to\b/i.test(tail) && !/esc to interrupt/i.test(tail));
+    /\bEsc\s+to\s+cancel\b/i.test(tail) ||
+    /[↑↓].*\bto select\b/i.test(tail);
 
-  if (cursorOnOption || menuFooter) return true;
-
-  // Text-input step (e.g. "Repo name?" then an empty box). It renders as a bare
-  // `❯ ` line (often inside box borders: `│ ❯   │`) with NO menu options and NO
-  // idle footer, preceded by a prompt line ending in a question/colon. Requires
-  // that preceding prompt so we don't catch every transient empty box.
-  const stripBox = (l) => l.replace(/[│┃|╭╮╰╯─━┌┐└┘┄┈]/g, ' ').trim();
-  const tLines = tail.split('\n').map(stripBox).filter(Boolean);
-  const lastEmptyBox = tLines.length > 0 && /^[❯>]\s*$/.test(tLines[tLines.length - 1]);
-  if (lastEmptyBox) {
-    const recent = tLines.slice(-6, -1);
-    if (recent.some(l => /[?？:：]\s*$/.test(l))) return true;
-  }
-  return false;
+  return cursorOnNumbered || menuFooter;
 }
 
 function detectScreenType(text) {
