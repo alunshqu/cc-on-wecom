@@ -49,18 +49,24 @@ const PROSE_PERMISSION = `⏺ The hook can return Allow or Deny to gate a tool c
 
 const PROSE_NUMBERED = `⏺ Here are the steps:\n\n1. Read the config file\n2. Parse the options\n3. Write the result\n\nDone.\n\n╭────────────────────────╮\n│ ❯                       │\n╰────────────────────────╯${FOOTER}`;
 
-// REAL trust prompt at startup.
-const TRUST = `╭─────────────────────────────────────────────╮\n│ Do you trust the files in this folder?        │\n│                                               │\n│ ❯ 1. Yes, I trust the files                   │\n│   2. No, exit                                 │\n╰─────────────────────────────────────────────╯`;
+// REAL trust prompt at startup, captured from Claude Code v2.1.156. The question
+// wording differs from older versions and the choices render as a 1./2. menu —
+// detection must key on the choice lines, not the question text.
+const TRUST = ` Accessing workspace:\n C:\\Users\\casstime\n Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source\n project, or work from your team). If not, take a moment to review what's in this folder first.\n Claude Code'll be able to read, edit, and execute files here.\n Security guide\n ❯ 1. Yes, I trust this folder\n   2. No, exit\n Enter to confirm · Esc to cancel`;
+
+// The real idle main-input screen on v2.1.156 (note the new footer wording).
+const IDLE_V2 = `⏺ Done.\n\n────────────────────────────────────────────\n❯  \n────────────────────────────────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents       ● high · /effort`;
 
 // ---- detectScreenType ----
 (async () => {
 const S = {};
-for (const [k, v] of Object.entries({ IDLE, PROCESSING, NUMBERED_MENU, RADIO_MENU, TEXT_INPUT, PERMISSION, PROSE_TRUST, PROSE_PERMISSION, PROSE_NUMBERED, TRUST })) {
+for (const [k, v] of Object.entries({ IDLE, IDLE_V2, PROCESSING, NUMBERED_MENU, RADIO_MENU, TEXT_INPUT, PERMISSION, PROSE_TRUST, PROSE_PERMISSION, PROSE_NUMBERED, TRUST })) {
   S[k] = await screen(v);
 }
 
 console.log('detectScreenType:');
 check('idle', detectScreenType(S.IDLE.text) === 'idle', detectScreenType(S.IDLE.text));
+check('idle v2.1.156 footer', detectScreenType(S.IDLE_V2.text) === 'idle', detectScreenType(S.IDLE_V2.text));
 check('processing', detectScreenType(S.PROCESSING.text) === 'processing', detectScreenType(S.PROCESSING.text));
 check('numbered menu → interactive', detectScreenType(S.NUMBERED_MENU.text) === 'interactive_prompt', detectScreenType(S.NUMBERED_MENU.text));
 check('radio menu → interactive', detectScreenType(S.RADIO_MENU.text) === 'interactive_prompt', detectScreenType(S.RADIO_MENU.text));

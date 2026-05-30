@@ -85,13 +85,16 @@ function detectScreenType(text) {
   const nonEmptyLines = lines.filter(l => l.trim());
   const tail = nonEmptyLines.slice(-15).join('\n');
 
-  // Trust prompt: require the structural signature (the question plus BOTH
-  // choice lines), not a loose substring — otherwise Claude's own prose about
-  // "trust this folder" or quoting the choices trips it mid-conversation.
-  const trustQuestion = /Do you trust the files in this folder\?/i.test(text) ||
-    /trust the files in this folder/i.test(text);
-  const trustChoices = /Yes,?\s*I trust/i.test(text) && /No,?\s*exit/i.test(text);
-  if (trustQuestion && trustChoices) {
+  // Trust prompt: key on the two distinctive choice lines, which the startup
+  // screen always renders as a selectable menu ("❯ 1. Yes, I trust …" /
+  // "2. No, exit"). The question wording varies across CLI versions (e.g.
+  // "Is this a project you created or one you trust?"), so we do NOT depend on
+  // it. Requiring BOTH choice lines plus an option marker keeps Claude's prose
+  // from tripping it — bare prose mentioning "trust" won't have the 1./2. menu.
+  const trustYes = /\bYes,?\s*I trust\b/i.test(text);
+  const trustNo = /\bNo,?\s*exit\b/i.test(text);
+  const trustMenuMarker = /(^|\n)\s*(?:❯\s*)?[12][.)、]\s*(?:Yes,?\s*I trust|No,?\s*exit)/im.test(text);
+  if (trustYes && trustNo && trustMenuMarker) {
     return 'trust_prompt';
   }
 
