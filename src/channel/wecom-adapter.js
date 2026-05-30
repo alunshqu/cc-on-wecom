@@ -268,33 +268,19 @@ class WeComAdapter extends BaseAdapter {
     const userId = frame.body?.from?.userid || 'unknown';
     const session = this._getUserSession(userId);
 
-    // Interactive prompt responses
-    if (key === 'interactive_approve') {
-      session.sendMessage('确认', async (response) => {
+    // Interactive prompt responses. We no longer send button cards (prompts are
+    // delivered as plain text), but keep these handlers so any in-flight legacy
+    // card still works — route the reply through the same text-based flow.
+    if (key === 'interactive_approve' || key === 'interactive_deny' || key.startsWith('interactive_opt_')) {
+      const reply = key === 'interactive_approve' ? '确认'
+        : key === 'interactive_deny' ? '取消'
+        : key.replace('interactive_opt_', '');
+      this._ensureInteractiveBound(userId, session);
+      session.sendMessage(reply, async (response) => {
+        if (session.phase === 'awaiting_input') return;
         if (response) await this.send(userId, this._condenseResponse(response));
       });
-      await this._replyText(frame, '✅').catch(() => {});
-      return;
-    }
-    if (key === 'interactive_deny') {
-      session.sendMessage('取消', async (response) => {
-        if (response) await this.send(userId, this._condenseResponse(response));
-      });
-      await this._replyText(frame, '❌').catch(() => {});
-      return;
-    }
-    if (key.startsWith('interactive_opt_')) {
-      const num = key.replace('interactive_opt_', '');
-      const onInteractive = async ({ state, message }) => {
-        session.removeListener('interactive-prompt', onInteractive);
-        await this._sendInteractiveCard(userId, state, message);
-      };
-      session.once('interactive-prompt', onInteractive);
-      session.sendMessage(num, async (response) => {
-        session.removeListener('interactive-prompt', onInteractive);
-        if (response) await this.send(userId, this._condenseResponse(response));
-      });
-      await this._replyText(frame, `已选 ${num}`).catch(() => {});
+      await this._replyText(frame, key === 'interactive_deny' ? '❌' : '✅').catch(() => {});
       return;
     }
 
@@ -343,15 +329,17 @@ class WeComAdapter extends BaseAdapter {
       }
     }
 
-    // Listen for interactive prompt (multi-step questions)
-    const onInteractive = async ({ state, response, message }) => {
-      session.removeListener('interactive-prompt', onInteractive);
-      await this._sendInteractiveCard(userId, state, message);
-    };
-    session.once('interactive-prompt', onInteractive);
+    // Listen for interactive prompt (multi-step questions). Delivered as plain
+    // text; the user replies with an option number or the literal input, and
+    // each reply flows back through here, re-arming for the next step until
+    // Claude produces a final answer.
+    this._ensureInteractiveBound(userId, session);
 
     session.sendMessage(text, async (response) => {
-      session.removeListener('interactive-prompt', onInteractive);
+      // An interactive transition fires this callback with the formatted prompt,
+      // but the persistent interactive-prompt listener already delivers it —
+      // skip so we don't double-send.
+      if (session.phase === 'awaiting_input') return;
       if (response) {
         const condensed = this._condenseResponse(response);
 
@@ -372,44 +360,30 @@ class WeComAdapter extends BaseAdapter {
     });
   }
 
-  async _sendInteractiveCard(userId, state, fallbackMessage) {
-    if (!this.wsClient) return;
+  // Bind a persistent listener that delivers every interactive prompt for this
+  // session as plain text. Survives multi-step flows (select → input → select …)
+  // because it stays attached across steps; torn down when the session finishes
+  // (response-complete) or stops. Idempotent per session.
+  _ensureInteractiveBound(userId, session) {
+    if (session._wecomInteractiveBound) return;
+    session._wecomInteractiveBound = true;
 
-    const buttons = [];
-    if (state.type === 'permission') {
-      buttons.push({ text: '✅ 允许', key: 'interactive_approve', style: 2 });
-      buttons.push({ text: '❌ 拒绝', key: 'interactive_deny', style: 2 });
-    } else if (state.type === 'confirm') {
-      buttons.push({ text: '确认', key: 'interactive_approve', style: 2 });
-      buttons.push({ text: '取消', key: 'interactive_deny', style: 2 });
-    } else if (state.type === 'select' && state.options.length) {
-      state.options.slice(0, 6).forEach((opt, i) => {
-        buttons.push({ text: opt.length > 12 ? opt.substring(0, 11) + '…' : opt, key: `interactive_opt_${i + 1}`, style: 1 });
-      });
-    }
-
-    if (buttons.length) {
-      try {
-        await this.wsClient.sendMessage(userId, {
-          msgtype: 'template_card',
-          template_card: {
-            card_type: 'button_interaction',
-            main_title: { title: state.prompt || '需要你的输入' },
-            sub_title_text: state.type === 'select'
-              ? state.options.map((o, i) => `${i + 1}. ${o}`).join('\n')
-              : '',
-            button_list: buttons,
-            task_id: `interact_${Date.now()}`,
-          },
-        });
-        return;
-      } catch (e) {
-        log('wecom', `Interactive card failed: ${e.message}`);
+    const onInteractive = async ({ message }) => {
+      if (message && message.trim()) {
+        const chunks = this._splitResponse(message, 18000);
+        for (const chunk of chunks) await this.send(userId, chunk);
       }
-    }
+    };
+    const teardown = () => {
+      session.removeListener('interactive-prompt', onInteractive);
+      session.removeListener('response-complete', teardown);
+      session.removeListener('exit', teardown);
+      session._wecomInteractiveBound = false;
+    };
 
-    // Fallback to text
-    await this.send(userId, fallbackMessage);
+    session.on('interactive-prompt', onInteractive);
+    session.once('response-complete', teardown);
+    session.once('exit', teardown);
   }
 
   _condenseResponse(text) {
