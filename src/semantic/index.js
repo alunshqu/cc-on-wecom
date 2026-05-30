@@ -1,4 +1,5 @@
 const EventEmitter = require('events');
+const crypto = require('crypto');
 const { AgentState } = require('./event-types');
 const { ClaudeAgent } = require('../cli-agent');
 const StateMachine = require('./state-machine');
@@ -16,7 +17,14 @@ class SemanticSession extends EventEmitter {
     this.status = 'starting';
     this.history = options.history || [];
     this.context = options.context || {};
-    this.claudeSessionId = options.claudeSessionId || null;
+    // Own the Claude session id from the start: reuse a restored one, otherwise
+    // generate it now. Passed to the CLI as --session-id on a fresh spawn so it
+    // is known up front and can be persisted for --resume after a restart.
+    // True only when the id was restored from disk — then we resume the prior
+    // conversation. A freshly generated id has no conversation yet, so it spawns
+    // fresh (the CLI creates the conversation under our --session-id).
+    this._restoredSession = Boolean(options.claudeSessionId);
+    this.claudeSessionId = options.claudeSessionId || crypto.randomUUID();
     this.sentTrustEnter = false;
     this.lastExtractedResponse = null;
     this.interactiveState = null;
@@ -45,7 +53,7 @@ class SemanticSession extends EventEmitter {
 
   // Public API
   start() {
-    if (this.claudeSessionId) {
+    if (this._restoredSession && this.claudeSessionId) {
       this.agent.spawnWithResume(this.claudeSessionId);
     } else {
       this.agent.spawnFresh();
@@ -101,17 +109,33 @@ class SemanticSession extends EventEmitter {
     });
 
     this.agent.on('exit', ({ exitCode }) => {
-      this._log(`Agent exited code=${exitCode}`);
-      const resumeFailed = this.agent.spawnUsedResume && this.phase === AgentState.INIT && exitCode !== 0;
-      if (resumeFailed) {
-        this._log('Resume failed, clearing Claude session id');
-        this.claudeSessionId = null;
-        this.agent.claudeSessionId = null;
-      }
+      this._log(`Agent exited code=${exitCode} phase=${this.phase}`);
+      // A resume spawn that exits non-zero before we ever reached a working state
+      // means the stored conversation is gone. Use spawnUsedResume (reliable) and
+      // "never became idle" rather than a specific phase, which a stray screen
+      // tick can move off INIT before this fires.
+      const neverReady = this.phase !== AgentState.IDLE && this.phase !== AgentState.AWAITING_INPUT;
+      const resumeFailed = this.agent.spawnUsedResume && neverReady && exitCode !== 0;
       this.phase = AgentState.STOPPED;
       this.status = 'stopped';
       this.emit('state-change', { from: this.phase, to: AgentState.STOPPED });
       this.emit('exit', { exitCode, resumeFailed });
+
+      if (resumeFailed) {
+        // The stored conversation is gone from Claude's local store (e.g. it was
+        // cleaned up). Don't let a stale id brick the session: drop it, generate
+        // a new one, and respawn fresh so the user can keep chatting (context is
+        // lost, but the session works).
+        this._log('Resume failed — starting a fresh conversation (prior context lost)');
+        this.claudeSessionId = crypto.randomUUID();
+        this.agent.claudeSessionId = this.claudeSessionId;
+        this._restoredSession = false;
+        this.phase = AgentState.INIT;
+        this.status = 'starting';
+        this.sentTrustEnter = false;
+        this.emit('session-id-captured', this.claudeSessionId);
+        setTimeout(() => { if (this.agent && !this.agent._destroyed) this.agent.spawnFresh(); }, 500);
+      }
     });
 
     this.agent.on('process-dead', () => {
@@ -120,7 +144,6 @@ class SemanticSession extends EventEmitter {
     });
 
     this.agent.on('output', (data) => {
-      this._captureClaudeSessionId(data);
       this.emit('output', data);
     });
   }
@@ -294,17 +317,6 @@ class SemanticSession extends EventEmitter {
     const entry = { role: 'assistant', content, timestamp: Date.now() };
     this.history.push(entry);
     this.emit('assistant-message', entry);
-  }
-
-  _captureClaudeSessionId(text) {
-    if (!text) return;
-    const match = text.match(/\b(?:Session(?:\s+ID)?|sessionId|conversation(?:\s+ID)?)[:"\s]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i);
-    if (match && match[1] !== this.claudeSessionId) {
-      this.claudeSessionId = match[1];
-      this.agent.claudeSessionId = match[1];
-      this._log(`Captured Claude session id: ${match[1]}`);
-      this.emit('session-id-captured', match[1]);
-    }
   }
 }
 

@@ -50,8 +50,25 @@ class SessionStore {
       appendSystemPrompt: options.appendSystemPrompt || null,
     });
     this.sessions.set(id, session);
+    this._attachPersistence(session);
     this._persist(session);
     return session;
+  }
+
+  // Re-persist whenever the conversation advances so history and the Claude
+  // session id survive a restart. Debounced to avoid thrashing the disk on
+  // rapid events. Bound once per session.
+  _attachPersistence(session) {
+    if (session._persistBound) return;
+    session._persistBound = true;
+    let timer = null;
+    const save = () => {
+      if (timer) return;
+      timer = setTimeout(() => { timer = null; this._persist(session); }, 500);
+    };
+    session.on('user-message', save);
+    session.on('assistant-message', save);
+    session.on('session-id-captured', save);
   }
 
   destroy(id) {
@@ -106,6 +123,7 @@ class SessionStore {
   }
 
   persist(session) { this._persist(session); }
+  deleteState(id) { this._deleteState(id); }
 
   // Internal persistence
   _persist(session) {

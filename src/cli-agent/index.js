@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const PtyProcess = require('./pty-process');
 const screenParser = require('./screen-parser');
 
@@ -19,7 +20,11 @@ class ClaudeAgent extends PtyProcess {
 
   spawnFresh() {
     this._spawnUsedResume = false;
-    const args = [];
+    // Assign our own session id up front so it is known and persistable without
+    // scraping it from the TUI (which never prints it). --session-id makes the
+    // CLI use exactly this id, so a later --resume <id> can continue the convo.
+    if (!this.claudeSessionId) this.claudeSessionId = crypto.randomUUID();
+    const args = ['--session-id', this.claudeSessionId];
     if (this.appendSystemPrompt) args.push('--append-system-prompt', this.appendSystemPrompt);
     this.spawn(args);
   }

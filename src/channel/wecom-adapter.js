@@ -120,10 +120,12 @@ class WeComAdapter extends BaseAdapter {
     if (this._warmSession && this._warmSession.phase === 'idle' && this._warmSession.agent.alive) {
       const id = `wecom_${userId.slice(-6)}`;
       const claimed = this._warmSession;
+      this.store.deleteState('wecom_warmup');   // old warmup state file is now stale
       claimed.id = id;
       this.store.sessions.delete('wecom_warmup');
       this.store.sessions.set(id, claimed);
       this.store.setUserSession(userId, id);
+      this.store.persist(claimed);              // save under the new id (with its claude session id)
       this._warmSession = null;
       log('wecom', `Assigned warm session to user ${userId} (${id})`);
       return claimed;
@@ -321,7 +323,14 @@ class WeComAdapter extends BaseAdapter {
 
     try { await this.wsClient.replyStream(frame, streamId, '⏳ 收到，处理中...', true); } catch (_) {}
 
+    // A restored session is created but not started until first use; a crashed
+    // one is stopped. In both cases start it (resume if we have a prior id) and
+    // wait for it to come up before sending.
     if (session.phase === 'stopped' || session.phase === 'init') {
+      if (!session.agent.alive) {
+        log('wecom', `Session ${session.id} not running, starting (resume=${session._restoredSession ? 'yes' : 'no'})`);
+        session.start();
+      }
       const ready = await this._waitForIdle(session, 120000);
       if (!ready) {
         await this.send(userId, '⚠️ Claude 未就绪，请稍后重试');
