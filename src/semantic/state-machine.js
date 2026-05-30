@@ -66,6 +66,10 @@ class StateMachine {
     } else if (screenType === 'done') {
       this.onProcessing();
       this._scheduleStabilityCheck('fast_done');
+    } else if (screenType === 'permission_prompt' || screenType === 'trust_prompt') {
+      // bypassPermissions is on, so these are false positives from response text
+      // (Claude discussing "trust"/"allow"). Treat as a settling screen, not a dead-end.
+      this._scheduleStabilityCheck(`sent_msg_${screenType}`);
     }
 
     if (!this._sentMsgTimeout) {
@@ -74,12 +78,13 @@ class StateMachine {
         if (s.phase !== AgentState.SENT_MSG) return;
         const currentType = detectScreenType(getScreenText(s.agent.vt));
         this.log(`sent_msg failsafe: screenType=${currentType}`);
-        if (currentType === 'idle' || currentType === 'done' || currentType === 'unknown') {
-          this.onFinish('sent_msg_failsafe');
-        } else if (currentType === 'processing') {
+        if (currentType === 'processing') {
           this.onProcessing();
         } else if (currentType === 'interactive_prompt') {
           this.onInteractive();
+        } else {
+          // idle / done / unknown / permission_prompt / trust_prompt — nothing left to wait for
+          this.onFinish('sent_msg_failsafe');
         }
       }, 20000);
     }
@@ -92,7 +97,10 @@ class StateMachine {
       if (this._doneTimer) { clearTimeout(this._doneTimer); this._doneTimer = null; }
     } else if (screenType === 'interactive_prompt') {
       this.onInteractive();
-    } else if (screenType === 'idle' || screenType === 'done' || screenType === 'unknown') {
+    } else {
+      // idle / done / unknown / permission_prompt / trust_prompt: not active work,
+      // so confirm the screen has settled and finish. permission/trust here are
+      // false positives (bypassPermissions is on), not a real prompt.
       this._scheduleStabilityCheck(`processing_to_${screenType}`);
     }
 
@@ -107,12 +115,14 @@ class StateMachine {
         if (inactiveMs >= 10000) {
           const currentType = detectScreenType(getScreenText(s.agent.vt));
           this.log(`Processing watchdog: inactive ${Math.round(inactiveMs / 1000)}s, screenType=${currentType}`);
-          if (currentType === 'idle' || currentType === 'done' || currentType === 'unknown') {
+          if (currentType === 'interactive_prompt') {
+            this.onInteractive();
+          } else if (currentType !== 'processing') {
+            // idle / done / unknown / permission_prompt / trust_prompt — inactive and
+            // not working: finish rather than spin forever on a stale screen.
             clearInterval(this._processingWatchdog);
             this._processingWatchdog = null;
             this.onFinish('watchdog_inactive');
-          } else if (currentType === 'interactive_prompt') {
-            this.onInteractive();
           }
         }
       }, 5000);
@@ -143,10 +153,12 @@ class StateMachine {
 
       if (currentType === 'interactive_prompt') {
         this.onInteractive();
-      } else if (currentType === 'idle' || currentType === 'done' || currentType === 'unknown') {
-        this.onFinish(reason);
       } else if (currentType === 'processing') {
         s.agent.lastActivityAt = Date.now();
+      } else {
+        // idle / done / unknown / permission_prompt / trust_prompt: screen is stable
+        // and not actively working — the response is complete.
+        this.onFinish(reason);
       }
     }, 2000);
   }
