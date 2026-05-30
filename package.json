@@ -5,7 +5,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "start:legacy": "node server.js"
+    "start:legacy": "node server.js",
+    "redeploy": "git pull && pm2 restart cc-on-wecom",
+    "test": "node test/prompt-detector.test.js"
   },
   "dependencies": {
     "@wecom/aibot-node-sdk": "^1.0.7",
