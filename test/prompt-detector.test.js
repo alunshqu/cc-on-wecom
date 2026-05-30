@@ -38,6 +38,22 @@ const NUMBERED_MENU = `Which visibility should the repo have?\n\n❯ 1. Public\n
 // Radio menu: ONLY the selected row carries the cursor; siblings are unmarked.
 const RADIO_MENU = `Select a model:\n\n❯ Default (recommended)\n  Opus\n  Sonnet\n\n  Enter to confirm`;
 
+// Real /model-style menu (captured from v2.1.156): a header title, a wrapped
+// description, then numbered rows whose label is padded apart from an inline
+// description, with the cursor on a middle row and a trailing footer. Exercises
+// header extraction, description trimming, sibling disambiguation, and selected.
+const MODEL_MENU = [
+  '❯ /model',
+  '',
+  'Select model',
+  'Switch between Claude models. Your pick becomes the default for new sessions.',
+  '  1. Default (recommended)  Use the default model · $5/$25 per Mtok',
+  '  2. claude-opus-4-8        Custom Opus model',
+  '  3. claude-opus-4-8        Custom Sonnet model',
+  '❯ 4. Opus 4.8 ✔             claude-opus-4-8',
+  '  Enter to set as default · s to use this session only · Esc to cancel',
+].join('\n');
+
 // The main input box with text already typed into it — the exact regression:
 // after a reply, the gateway writes "/context" into the box BEFORE pressing
 // Enter, so the screen briefly shows "❯ /context". This must read as idle, not
@@ -70,7 +86,7 @@ const IDLE_V2 = `⏺ Done.\n\n────────────────�
 // ---- detectScreenType ----
 (async () => {
 const S = {};
-for (const [k, v] of Object.entries({ IDLE, IDLE_V2, INPUT_TYPED, PROCESSING, NUMBERED_MENU, RADIO_MENU, TEXT_INPUT, PERMISSION, PROSE_TRUST, PROSE_PERMISSION, PROSE_NUMBERED, TRUST })) {
+for (const [k, v] of Object.entries({ IDLE, IDLE_V2, INPUT_TYPED, PROCESSING, NUMBERED_MENU, RADIO_MENU, MODEL_MENU, TEXT_INPUT, PERMISSION, PROSE_TRUST, PROSE_PERMISSION, PROSE_NUMBERED, TRUST })) {
   S[k] = await screen(v);
 }
 
@@ -109,6 +125,15 @@ check('radio: type select', radio.type === 'select', radio.type);
 check('radio: 3 options (siblings kept)', radio.options.length === 3, JSON.stringify(radio.options));
 check('radio: selected=0', radio.selected === 0, String(radio.selected));
 check('radio: label has no marker', radio.options[0] === 'Default (recommended)', JSON.stringify(radio.options[0]));
+
+const model = parseInteractiveState(S.MODEL_MENU.vt);
+check('model: type select', model.type === 'select', model.type);
+check('model: prompt is header', model.prompt === 'Select model', JSON.stringify(model.prompt));
+check('model: 4 options (no prose)', model.options.length === 4, JSON.stringify(model.options));
+check('model: selected=3 (cursor row)', model.selected === 3, String(model.selected));
+check('model: label 1 trimmed', model.options[0] === 'Default (recommended)', JSON.stringify(model.options[0]));
+check('model: dup shorts disambiguated', model.options[1] !== model.options[2], `${model.options[1]} / ${model.options[2]}`);
+check('model: no footer in options', !model.options.some(o => /Esc to cancel|set as default/i.test(o)), JSON.stringify(model.options));
 
 const textInput = parseInteractiveState(S.TEXT_INPUT.vt);
 check('text input: type text_input', textInput.type === 'text_input', textInput.type);

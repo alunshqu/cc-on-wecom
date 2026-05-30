@@ -270,13 +270,22 @@ class SemanticSession extends EventEmitter {
     if (control === '\r') { this.agent.sendEnter(); return; }
     if (control === '\x1b') { this.agent.sendEscape(); return; }
 
-    const state = this.interactiveState;
     const numMatch = String(text).trim().match(/^(\d+)$/);
-    if (state && state.type === 'select' && state.options.length && numMatch) {
-      const target = parseInt(numMatch[1], 10) - 1;
-      if (target >= 0 && target < state.options.length) {
-        this._navigateAndConfirm(state.selected == null ? 0 : state.selected, target);
-        return;
+    if (numMatch) {
+      // Re-read the live menu right now rather than trusting the snapshot taken
+      // when the prompt was first shown — the cursor may have moved, and a stale
+      // selected index makes the arrow count desync (the user's "1" then lands on
+      // the wrong row). Recomputing from the current screen keeps it in sync.
+      const live = parseInteractiveState(this.agent.vt);
+      if (live.type === 'select' && live.options.length) {
+        const target = parseInt(numMatch[1], 10) - 1;
+        if (target >= 0 && target < live.options.length) {
+          const from = live.selected == null ? 0 : live.selected;
+          this._log(`Interactive select: ${numMatch[1]} (from ${from} to ${target} of ${live.options.length})`);
+          this._navigateAndConfirm(from, target);
+          return;
+        }
+        this._log(`Interactive select out of range: ${numMatch[1]} (have ${live.options.length})`);
       }
     }
 
@@ -285,16 +294,27 @@ class SemanticSession extends EventEmitter {
     setTimeout(() => { if (this.agent.alive) this.agent.sendEnter(); }, 100);
   }
 
+  // Move the menu cursor to `to` by sending one arrow key at a time and
+  // re-reading the live cursor after each, instead of firing a fixed burst.
+  // ConPTY drops/coalesces rapid keystrokes, so an open-loop burst lands on the
+  // wrong row; a verified step loop is reliable. Confirms once on arrival.
   _navigateAndConfirm(from, to) {
-    const delta = to - from;
-    const step = delta > 0 ? () => this.agent.sendArrowDown() : () => this.agent.sendArrowUp();
-    let remaining = Math.abs(delta);
-    const tick = () => {
+    const maxSteps = 24;          // safety bound (menu len + slack)
+    let steps = 0;
+    const stepOnce = () => {
       if (!this.agent.alive) return;
-      if (remaining > 0) { step(); remaining--; setTimeout(tick, 40); }
-      else { this.agent.sendEnter(); }
+      const live = parseInteractiveState(this.agent.vt);
+      const cur = live.selected == null ? from : live.selected;
+      if (cur === to || steps >= maxSteps) {
+        this._log(`Interactive confirm at row ${cur} (target ${to}, ${steps} steps)`);
+        this.agent.sendEnter();
+        return;
+      }
+      if (to > cur) this.agent.sendArrowDown(); else this.agent.sendArrowUp();
+      steps++;
+      setTimeout(stepOnce, 120);   // give ConPTY time to render the moved cursor
     };
-    tick();
+    stepOnce();
   }
 
   _drainQueue() {
