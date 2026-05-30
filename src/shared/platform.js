@@ -19,7 +19,6 @@ function defaultClaudePath() {
 }
 
 function shellEnv() {
-  if (IS_WIN) return { ...process.env };
   return { ...process.env, TERM: 'xterm-256color' };
 }
 

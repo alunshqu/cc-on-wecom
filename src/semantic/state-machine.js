@@ -74,7 +74,7 @@ class StateMachine {
         if (s.phase !== AgentState.SENT_MSG) return;
         const currentType = detectScreenType(getScreenText(s.agent.vt));
         this.log(`sent_msg failsafe: screenType=${currentType}`);
-        if (currentType === 'idle') {
+        if (currentType === 'idle' || currentType === 'done' || currentType === 'unknown') {
           this.onFinish('sent_msg_failsafe');
         } else if (currentType === 'processing') {
           this.onProcessing();
