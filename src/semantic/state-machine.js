@@ -1,5 +1,6 @@
 const { AgentState } = require('./event-types');
 const { getScreenText, detectScreenType } = require('../cli-agent/screen-parser');
+const { extractResponse } = require('./response-extractor');
 
 class StateMachine {
   constructor(session, { log, onReady, onFinish, onInteractive, onProcessing }) {
@@ -62,7 +63,13 @@ class StateMachine {
     } else if (screenType === 'interactive_prompt') {
       this.onInteractive();
     } else if (screenType === 'idle') {
-      this._scheduleStabilityCheck('sent_msg_idle');
+      // Right after sending, the screen can briefly show the idle input box
+      // because Claude hasn't started yet (slow spawn / resume). Only treat idle
+      // as "done" if a reply is actually extractable; otherwise keep waiting so
+      // we don't finish prematurely with an empty response.
+      if (this._hasExtractableResponse()) {
+        this._scheduleStabilityCheck('sent_msg_idle');
+      }
     } else if (screenType === 'done') {
       this.onProcessing();
       this._scheduleStabilityCheck('fast_done');
@@ -158,9 +165,28 @@ class StateMachine {
       } else {
         // idle / done / unknown / permission_prompt / trust_prompt: screen is stable
         // and not actively working — the response is complete.
+        // Guard against the SENT_MSG race: if we're still in SENT_MSG and nothing
+        // is extractable yet, Claude simply hasn't started — keep waiting instead
+        // of finishing with an empty response.
+        if (s.phase === AgentState.SENT_MSG && !this._hasExtractableResponse()) {
+          this._scheduleStabilityCheck(reason + '_wait');
+          return;
+        }
         this.onFinish(reason);
       }
     }, 2000);
+  }
+
+  // Whether a non-empty reply can currently be parsed off the screen for the
+  // in-flight request. Used to distinguish "Claude answered" from "Claude hasn't
+  // started yet" when the SENT_MSG screen looks idle.
+  _hasExtractableResponse() {
+    try {
+      const text = extractResponse(this.session.agent.vt, this.session.currentRequest?.text);
+      return Boolean(text && text.trim());
+    } catch (_) {
+      return false;
+    }
   }
 
   clearTimers() {
