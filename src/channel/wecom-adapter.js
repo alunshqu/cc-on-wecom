@@ -170,12 +170,7 @@ class WeComAdapter extends BaseAdapter {
     }, delay);
   }
 
-  _onEnterChat(frame) {
-    this.wsClient.replyWelcome(frame, {
-      msgtype: 'text',
-      text: { content: '你好！我是 Claude AI 助手，直接发消息即可对话。/help 查看命令。' },
-    }).catch(e => log('wecom', `Welcome error: ${e.message || JSON.stringify(e)}`));
-  }
+  _onEnterChat(_frame) {}
 
   async _onText(frame) {
     const userId = frame.body?.from?.userid || 'unknown';
@@ -340,8 +335,8 @@ class WeComAdapter extends BaseAdapter {
 
     try { await this.wsClient.replyStream(frame, streamId, '⏳ 收到，处理中...', true); } catch (_) {}
 
-    if (session.phase !== 'idle' && session.phase !== 'awaiting_input') {
-      const ready = await this._waitForIdle(session, 30000);
+    if (session.phase === 'stopped' || session.phase === 'init') {
+      const ready = await this._waitForIdle(session, 120000);
       if (!ready) {
         await this.send(userId, '⚠️ Claude 未就绪，请稍后重试');
         return;
