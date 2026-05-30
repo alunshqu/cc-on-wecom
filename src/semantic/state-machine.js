@@ -19,6 +19,10 @@ class StateMachine {
   }
 
   tick() {
+    // While an interactive reply is being delivered (arrow navigation + confirm)
+    // the menu is mid-redraw; ticking would misread it and fire spurious
+    // transitions that race the navigation. The session sets this guard.
+    if (this.session._interactiveBusy) return;
     const text = getScreenText(this.session.agent.vt);
     const screenType = detectScreenType(text);
     this.handleState(screenType);

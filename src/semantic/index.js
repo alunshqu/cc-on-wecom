@@ -67,7 +67,7 @@ class SemanticSession extends EventEmitter {
     }
 
     if (this.phase === AgentState.AWAITING_INPUT && !options.internal) {
-      this._sendNow(text, onComplete, { ...options, interactiveReply: true });
+      this._sendInteractiveReply(text, onComplete, options);
       return { ok: true };
     }
 
@@ -228,7 +228,6 @@ class SemanticSession extends EventEmitter {
     const request = {
       internal: Boolean(options.internal),
       persistHistory: options.persistHistory !== false,
-      interactiveReply: Boolean(options.interactiveReply),
       kind: options.kind || 'user',
       text,
     };
@@ -251,70 +250,90 @@ class SemanticSession extends EventEmitter {
       this.pendingCallbacks.push({ cb: onComplete, internal: request.internal, kind: request.kind });
     }
 
-    if (request.interactiveReply) {
-      this._deliverInteractiveReply(text);
-      return;
-    }
-
     const sanitized = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
     this.agent.write(sanitized);
     setTimeout(() => { if (this.agent.alive) this.agent.sendEnter(); }, 100);
   }
 
-  // Deliver a reply while Claude is showing an interactive prompt. Confirm/cancel
-  // map to Enter/Escape. A bare option number navigates the menu with arrow keys
-  // and confirms once — typing the digit is unreliable and the old trailing Enter
-  // leaked a stray newline into the next prompt.
-  _deliverInteractiveReply(text) {
+  // Deliver a reply while Claude is showing an interactive prompt, WITHOUT going
+  // through the normal SENT_MSG flip. Flipping early let the state machine tick
+  // on the still-open menu and race the multi-step arrow navigation (the cursor
+  // desynced and the wrong row got confirmed). Instead we stay in AWAITING_INPUT,
+  // pause the state machine, send the keystrokes, and only transition to
+  // PROCESSING after the confirming Enter — so the next response is captured.
+  _sendInteractiveReply(text, onComplete, options = {}) {
+    this.stateMachine.clearTimers();   // no ticks while we navigate the menu
+    this._interactiveBusy = true;      // suspend state-machine ticks during nav
+
+    const request = { internal: false, persistHistory: options.persistHistory !== false, kind: 'user', text };
+    this.currentRequest = request;
+    if (request.persistHistory) {
+      const entry = { role: 'user', content: text, timestamp: Date.now() };
+      this.history.push(entry);
+      this.emit('user-message', entry);
+    }
+    if (onComplete) this.pendingCallbacks.push({ cb: onComplete, internal: false, kind: 'user' });
+    this._log(`Interactive reply: ${String(text).substring(0, 60)}`);
+
+    // After the keystrokes are committed, resume ticks and move to PROCESSING so
+    // the resulting response (or the next interactive step) is detected.
+    const commit = () => {
+      this._interactiveBusy = false;
+      const prev = this.phase;
+      this.phase = AgentState.PROCESSING;
+      this.status = 'processing';
+      this.agent.lastActivityAt = Date.now();
+      this.emit('state-change', { from: prev, to: AgentState.PROCESSING });
+    };
+
     const control = normalizeInteractiveInput(text);
-    if (control === '\r') { this.agent.sendEnter(); return; }
-    if (control === '\x1b') { this.agent.sendEscape(); return; }
+    if (control === '\r') { this.agent.sendEnter(); setTimeout(commit, 150); return; }
+    if (control === '\x1b') { this.agent.sendEscape(); setTimeout(commit, 150); return; }
 
     const numMatch = String(text).trim().match(/^(\d+)$/);
     if (numMatch) {
-      // Re-read the live menu right now rather than trusting the snapshot taken
-      // when the prompt was first shown — the cursor may have moved, and a stale
-      // selected index makes the arrow count desync (the user's "1" then lands on
-      // the wrong row). Recomputing from the current screen keeps it in sync.
       const live = parseInteractiveState(this.agent.vt);
       if (live.type === 'select' && live.options.length) {
         const target = parseInt(numMatch[1], 10) - 1;
         if (target >= 0 && target < live.options.length) {
           const from = live.selected == null ? 0 : live.selected;
           this._log(`Interactive select: ${numMatch[1]} (from ${from} to ${target} of ${live.options.length})`);
-          this._navigateAndConfirm(from, target);
+          this._navigateAndConfirm(from, target, commit);
           return;
         }
         this._log(`Interactive select out of range: ${numMatch[1]} (have ${live.options.length})`);
       }
     }
 
+    // Free-text reply into a text-input prompt.
     const sanitized = String(text).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
     this.agent.write(sanitized);
-    setTimeout(() => { if (this.agent.alive) this.agent.sendEnter(); }, 100);
+    setTimeout(() => { if (this.agent.alive) this.agent.sendEnter(); setTimeout(commit, 150); }, 100);
   }
 
   // Move the menu cursor to `to` by sending one arrow key at a time and
   // re-reading the live cursor after each, instead of firing a fixed burst.
   // ConPTY drops/coalesces rapid keystrokes, so an open-loop burst lands on the
-  // wrong row; a verified step loop is reliable. Confirms once on arrival.
-  _navigateAndConfirm(from, to) {
+  // wrong row; a verified step loop is reliable. Confirms once on arrival, then
+  // calls onDone (to transition state) after the Enter is sent.
+  _navigateAndConfirm(from, to, onDone) {
     const maxSteps = 24;          // safety bound (menu len + slack)
     let steps = 0;
     const stepOnce = () => {
-      if (!this.agent.alive) return;
+      if (!this.agent.alive) { if (onDone) onDone(); return; }
       const live = parseInteractiveState(this.agent.vt);
       const cur = live.selected == null ? from : live.selected;
       if (cur === to || steps >= maxSteps) {
         this._log(`Interactive confirm at row ${cur} (target ${to}, ${steps} steps)`);
         this.agent.sendEnter();
+        if (onDone) setTimeout(onDone, 150);
         return;
       }
       if (to > cur) this.agent.sendArrowDown(); else this.agent.sendArrowUp();
       steps++;
-      setTimeout(stepOnce, 120);   // give ConPTY time to render the moved cursor
+      setTimeout(stepOnce, 250);   // give ConPTY time to render the moved cursor
     };
-    stepOnce();
+    setTimeout(stepOnce, 200);     // let the menu settle before the first read
   }
 
   _drainQueue() {
