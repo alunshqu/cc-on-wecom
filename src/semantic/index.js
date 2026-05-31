@@ -332,11 +332,12 @@ class SemanticSession extends EventEmitter {
     // reply with a clear message and re-show the menu, rather than silently
     // applying only the valid ones (the user wouldn't know what took effect).
     if (live.type === 'multi_select' && optCount) {
-      // "提交/ok/确认" with nothing to toggle: go straight to the Submit stage.
-      // (A bare Enter here would only toggle the current row, not submit.)
+      // "提交/ok/确认": advance this stage (→ one cell). If that lands on Submit
+      // the next screen will be the review menu; if it lands on another question
+      // the user just keeps answering. We never auto-hunt Submit.
       if (control === '\r') {
-        this._log('Interactive multi-select: explicit submit, no toggles');
-        this._toggleAndSubmit([], live._submitRow, commit);
+        this._log('Interactive multi-select: advance with no toggles');
+        this._toggleAndAdvance([], commit);
         return;
       }
       const map = live._fullToReal || live.options.map((_, i) => i);  // displayed->full
@@ -369,8 +370,8 @@ class SemanticSession extends EventEmitter {
       }
       const dispTargets = [...new Set(nums.map(n => n - 1))];
       const fullTargets = dispTargets.map(i => map[i]);
-      this._log(`Interactive multi-select: toggle displayed ${dispTargets.map(i => i + 1).join(',')} -> full rows ${fullTargets.join(',')}; submitRow=${live._submitRow}`);
-      this._toggleAndSubmit(fullTargets, live._submitRow, commit);
+      this._log(`Interactive multi-select: toggle full rows ${fullTargets.join(',')}, then advance one stage`);
+      this._toggleAndAdvance(fullTargets, commit);
       return;
     }
 
@@ -442,13 +443,19 @@ class SemanticSession extends EventEmitter {
 
   // Move the menu cursor to displayed row `to` (verified step loop), then call
   // done() — without pressing Enter (caller decides what to do on arrival).
+  // Bounded by option count and stall-detected to avoid flooding the terminal.
   _navigateToRow(from, to, done) {
-    let steps = 0;
+    const first = parseInteractiveState(this.agent.vt);
+    const cap = ((first.options ? first.options.length : 0) || 8) + 3;
+    let steps = 0, lastCur = null, stalls = 0;
     const stepOnce = () => {
       if (!this.agent.alive) { done(); return; }
       const live = parseInteractiveState(this.agent.vt);
       const cur = live.selected == null ? from : live.selected;
-      if (cur === to || steps >= 30) { done(); return; }
+      const stuck = (cur === lastCur) && (++stalls >= 2);
+      if (cur === to || steps >= cap || stuck) { done(); return; }
+      if (cur !== lastCur) stalls = 0;
+      lastCur = cur;
       if (to > cur) this.agent.sendArrowDown(); else this.agent.sendArrowUp();
       steps++;
       setTimeout(stepOnce, 250);
@@ -483,18 +490,25 @@ class SemanticSession extends EventEmitter {
   // wrong row; a verified step loop is reliable. Confirms once on arrival, then
   // calls onDone (to transition state) after the Enter is sent.
   _navigateAndConfirm(from, to, onDone) {
-    const maxSteps = 24;          // safety bound (menu len + slack)
-    let steps = 0;
+    // Bound by the actual option count (+slack), and stop if the cursor stops
+    // moving — an unbounded loop here fired ~24 arrow keys when the cursor was
+    // stuck, which floods/redraws the terminal (the "刷屏" the user saw).
+    const first = parseInteractiveState(this.agent.vt);
+    const cap = ((first.options ? first.options.length : 0) || 8) + 3;
+    let steps = 0, lastCur = null, stalls = 0;
     const stepOnce = () => {
       if (!this.agent.alive) { if (onDone) onDone(); return; }
       const live = parseInteractiveState(this.agent.vt);
       const cur = live.selected == null ? from : live.selected;
-      if (cur === to || steps >= maxSteps) {
-        this._log(`Interactive confirm at row ${cur} (target ${to}, ${steps} steps)`);
+      const stuck = (cur === lastCur) && (++stalls >= 2);
+      if (cur === to || steps >= cap || stuck) {
+        this._log(`Interactive confirm at row ${cur} (target ${to}, ${steps} steps${stuck ? ', stalled' : ''})`);
         this.agent.sendEnter();
         if (onDone) setTimeout(onDone, 150);
         return;
       }
+      if (cur !== lastCur) stalls = 0;
+      lastCur = cur;
       if (to > cur) this.agent.sendArrowDown(); else this.agent.sendArrowUp();
       steps++;
       setTimeout(stepOnce, 250);   // give ConPTY time to render the moved cursor
@@ -502,32 +516,42 @@ class SemanticSession extends EventEmitter {
     setTimeout(stepOnce, 200);     // let the menu settle before the first read
   }
 
-  // Multi-select in FULL row coordinates (what the arrow keys move through).
-  // For each target row: navigate the cursor there (verified step loop reading
-  // the live full-coords cursor), and Space-toggle it ON only if not already
-  // checked (idempotent). After all toggles, navigate to the Submit row and
-  // Enter — so the user never types "提交". If there is no Submit row, fall back
-  // to a plain Enter (some checkbox menus submit on Enter).
-  _toggleAndSubmit(fullTargets, submitRow, onDone) {
+  // Multi-select in FULL row coordinates (what arrow keys move through). For
+  // each target row: navigate the cursor there (verified, tightly bounded) and
+  // Space-toggle it ON only if not already checked (idempotent). Then ADVANCE
+  // EXACTLY ONE STAGE — NOT hunt for Submit. In a multi-step form, → moves to the
+  // next stage; if that stage is another question the user keeps answering, and
+  // only when → lands on the Submit stage does the next screen become the review
+  // menu (which the user submits with an explicit reply). Auto-hunting Submit
+  // here used to blow past unanswered stages and submit an incomplete form.
+  // For a lone checkbox with no stage bar, Enter commits it.
+  _toggleAndAdvance(fullTargets, onDone) {
     const queue = [...fullTargets];
 
-    // Read the menu in FULL coordinates straight from the screen.
     const rawMenu = () => {
       const st = parseInteractiveState(this.agent.vt);
       return {
         cursor: st._fullToReal && st.selected != null ? st._fullToReal[st.selected] : null,
         checked: st._fullChecked || [],
-        submitRow: typeof st._submitRow === 'number' ? st._submitRow : submitRow,
+        rowCount: (st._fullToReal ? st._fullToReal.length : (st.options ? st.options.length : 0)),
+        hasStageBar: Boolean(st.stageBar),
       };
     };
 
+    // Move the cursor to full-row `to`, bounded by the row count (+slack), and
+    // bail if an arrow doesn't move the cursor (prevents the key-flood that was
+    // redrawing/scrolling the screen).
     const stepToRow = (to, after) => {
-      let steps = 0;
+      const cap = (rawMenu().rowCount || 8) + 3;
+      let steps = 0, lastCur = null, stalls = 0;
       const tick = () => {
         if (!this.agent.alive) { after(rawMenu()); return; }
         const m = rawMenu();
         const cur = m.cursor == null ? 0 : m.cursor;
-        if (cur === to || steps >= 30) { after(m); return; }
+        if (cur === to || steps >= cap) { after(m); return; }
+        if (cur === lastCur) { if (++stalls >= 2) { this._log(`nav stalled at row ${cur} (want ${to}), giving up`); after(m); return; } }
+        else stalls = 0;
+        lastCur = cur;
         if (to > cur) this.agent.sendArrowDown(); else this.agent.sendArrowUp();
         steps++;
         setTimeout(tick, 250);
@@ -535,47 +559,20 @@ class SemanticSession extends EventEmitter {
       setTimeout(tick, 200);
     };
 
-    // Submit a multi-select. Multi-step prompts have a top stage bar
-    // (← stage1 … Submit →) navigated with ←/→; the last stage is Submit and
-    // Enter there commits. Press → until we're on the Submit stage, then Enter.
-    // Detecting "on Submit": the checkbox option list disappears (no multi_select
-    // options parsed) while the stage bar is still present — the Submit stage has
-    // no question. Also accept an explicit current==submit stage match.
-    const submit = () => {
-      let steps = 0;
-      const tick = () => {
-        if (!this.agent.alive) { if (onDone) onDone(); return; }
-        const st = parseInteractiveState(this.agent.vt);
-        if (!st.stageBar) {
-          this._log('Interactive multi-select: no stage bar, Enter to submit');
-          this.agent.sendEnter();
-          if (onDone) setTimeout(onDone, 150);
-          return;
-        }
-        const onSubmitByIndex = st.currentStageIndex >= 0 && st.currentStageIndex === st.submitStageIndex;
-        const onSubmitByEmpty = st.type !== 'multi_select' || !st.options || st.options.length === 0;
-        if (steps > 0 && (onSubmitByIndex || onSubmitByEmpty)) {
-          this._log(`Interactive multi-select: on Submit stage (idx=${st.currentStageIndex}/${st.submitStageIndex}, opts=${st.options ? st.options.length : 0}), Enter`);
-          this.agent.sendEnter();
-          if (onDone) setTimeout(onDone, 150);
-          return;
-        }
-        if (steps >= 12) {
-          this._log(`Interactive multi-select: could not reach Submit (idx=${st.currentStageIndex}/${st.submitStageIndex}), Enter fallback`);
-          this.agent.sendEnter();
-          if (onDone) setTimeout(onDone, 150);
-          return;
-        }
-        this._log(`Interactive multi-select: → toward Submit (stage ${st.currentStageIndex}/${st.submitStageIndex})`);
+    const advance = () => {
+      const m = rawMenu();
+      if (m.hasStageBar) {
+        this._log('Interactive multi-select: → advance one stage');
         this.agent.sendArrowRight();
-        steps++;
-        setTimeout(tick, 280);
-      };
-      setTimeout(tick, 250);
+      } else {
+        this._log('Interactive multi-select: no stage bar, Enter to commit');
+        this.agent.sendEnter();
+      }
+      if (onDone) setTimeout(onDone, 200);
     };
 
     const nextTarget = () => {
-      if (!queue.length) { submit(); return; }
+      if (!queue.length) { advance(); return; }
       const to = queue.shift();
       stepToRow(to, (m) => {
         const alreadyChecked = Array.isArray(m.checked) && m.checked[to] === true;

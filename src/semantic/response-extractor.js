@@ -39,7 +39,16 @@ function findPromptForRequest(lines, requestText, searchStart) {
 }
 
 function extractResponse(vt, requestText) {
-  const lines = getScreenLines(vt);
+  const allLines = getScreenLines(vt);
+
+  // getScreenLines returns the FULL scrollback (up to thousands of lines). If
+  // Claude ran many tools / printed a lot, scanning from the user's prompt to the
+  // bottom captures the entire history — which got dumped to the user as dozens
+  // of chat messages ("刷屏"). Bound the scan to a recent window: the final
+  // assistant answer always sits near the bottom.
+  const MAX_SCAN = 160;
+  const offset = Math.max(0, allLines.length - MAX_SCAN);
+  const lines = allLines.slice(offset);
 
   let lastEmptyPrompt = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -58,11 +67,13 @@ function extractResponse(vt, requestText) {
       break;
     }
   }
-  if (userMsgPrompt === -1) return null;
+  // If the user prompt scrolled out of the window, start from the window top
+  // rather than returning nothing — we still only emit the recent tail.
+  const startLine = userMsgPrompt === -1 ? 0 : userMsgPrompt + 1;
 
   const endLine = lastEmptyPrompt !== -1 ? lastEmptyPrompt : lines.length;
   const result = [];
-  for (let i = userMsgPrompt + 1; i < endLine; i++) {
+  for (let i = startLine; i < endLine; i++) {
     const trimmed = lines[i].trim();
     if (!trimmed) continue;
     if (isNoiseLine(trimmed)) continue;
