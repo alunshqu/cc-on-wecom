@@ -230,9 +230,14 @@ function collectCursorMenu(tail, state) {
 
 function formatInteractivePrompt(state, response) {
   const parts = [];
-  if (response) parts.push(response);
+  // For menu-type prompts (select/permission/confirm) the raw response IS the
+  // on-screen menu, which we re-render cleanly below — prepending it would show
+  // the menu twice (and the raw copy drops the cursor row / mangles numbering).
+  // Only prepend the response for text-input/unknown, where it carries context.
+  const isMenu = state.type === 'select' || state.type === 'permission' || state.type === 'confirm';
+  if (response && !isMenu) parts.push(response);
 
-  if (state.prompt && (!response || !response.includes(state.prompt))) {
+  if (state.prompt && (!response || isMenu || !response.includes(state.prompt))) {
     parts.push(`**${state.prompt}**`);
   }
 

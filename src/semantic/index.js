@@ -276,14 +276,15 @@ class SemanticSession extends EventEmitter {
     this._log(`Interactive reply: ${String(text).substring(0, 60)}`);
 
     // After the keystrokes are committed, resume ticks and move to PROCESSING so
-    // the resulting response (or the next interactive step) is detected.
+    // the resulting response (or the next interactive step) is detected. Use the
+    // normal transition (logs "Processing started", clears stale timers) and kick
+    // a tick so the watchdog/stability machinery engages immediately instead of
+    // waiting for the next PTY event — that wait is what made replies feel slow.
     const commit = () => {
       this._interactiveBusy = false;
-      const prev = this.phase;
-      this.phase = AgentState.PROCESSING;
-      this.status = 'processing';
-      this.agent.lastActivityAt = Date.now();
-      this.emit('state-change', { from: prev, to: AgentState.PROCESSING });
+      this.agent.lastActivityAt = Date.now();   // fresh, so the watchdog doesn't fire early
+      this._transitionToProcessing();
+      this.stateMachine.tick();
     };
 
     const control = normalizeInteractiveInput(text);
