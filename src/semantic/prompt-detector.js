@@ -20,10 +20,15 @@ function stripBoxKeepSpacing(line) {
 // Chrome lines that are never selectable option labels. (Note: status-bar words
 // like "Opus"/"claude-" are intentionally NOT here — they never match the
 // numbered/marker option shapes, yet ARE valid labels in a model-select menu.)
-const OPTION_NOISE = /^(Submit|Skills|Using|Context Usage|esc to|press |enter to)/i;
+// "Submit" must be anchored ($) so it only drops the standalone Submit
+// affordance, NOT a real option like "Submit answers".
+const OPTION_NOISE = /^(Submit\s*$|Skills\b|Using\b|Context Usage\b|esc to|press |enter to)/i;
 
 // Navigation/footer hints the CLI prints under a menu. These are not options.
-const MENU_HINT = /(?:[↑↓←→].*(?:select|confirm|submit))|(?:\bto (?:select|confirm|submit|cycle)\b)|esc to|shift\+tab|bypass permissions/i;
+// The "<key> to <action>" forms are anchored to real footer keys (Enter/Tab/
+// Esc/arrows) so a prose question like "Ready to submit your answers?" — which
+// contains "to submit" — is NOT mistaken for a footer.
+const MENU_HINT = /(?:[↑↓←→].*(?:select|confirm|submit))|(?:\b(?:Enter|Tab|Esc|Space|↑|↓|←|→)\b[^\n]*\bto (?:select|confirm|submit|cycle|navigate)\b)|esc to|shift\+tab|bypass permissions/i;
 
 // Returns the option label for a real menu line, or null if the line is not a
 // selectable option. Only numbered lines (`1.` `2.`) and lines led by a genuine
@@ -246,19 +251,22 @@ function parseInteractiveState(vt) {
     menuFirstLine = collectCursorMenu(tail, state);
   }
 
-  // The prompt is the header just above the menu block — the CLI renders the
-  // title there ("Select model", "Do you want to…"), sometimes followed by a
-  // wrapped description. Walk up over the contiguous non-chrome header lines and
-  // take the TOPMOST one (the title), not the description's last wrapped line.
+  // The prompt is the header just above the menu block. Walk up over the
+  // contiguous non-chrome header lines. If any ends in a question/colon, prefer
+  // the one CLOSEST to the menu (e.g. "Ready to submit your answers?" on a review
+  // screen, sitting just above the options, below unrelated prose). Otherwise
+  // take the topmost line (a title with a wrapped description below it).
   if (menuFirstLine > 0) {
-    let header = '';
-    for (let i = menuFirstLine - 1; i >= 0 && i >= menuFirstLine - 5; i--) {
+    let topmost = '';
+    let closestQuestion = '';
+    for (let i = menuFirstLine - 1; i >= 0 && i >= menuFirstLine - 6; i--) {
       const line = tail[i];
       if (!line) continue;
       if (isMenuChrome(line)) break;       // hit chrome → header block ended
-      header = line;                        // keep climbing; topmost wins
+      if (!closestQuestion && /[？?：:]\s*$/.test(line)) closestQuestion = line;
+      topmost = line;                      // keep climbing; topmost wins as fallback
     }
-    if (header) state.prompt = header;
+    state.prompt = closestQuestion || topmost || state.prompt;
   }
   if (!state.prompt) {
     const questionLines = tail.filter(line => !isMenuChrome(line) && /[？?：:]\s*$/.test(line));
@@ -303,7 +311,7 @@ function isMenuChrome(line) {
   return /^←/.test(line) ||
     /^[❯>→]?\s*\d+[.)、]/.test(line) ||
     /^[❯>]/.test(line) ||                                // the input-echo / cursor line
-    /\bSubmit\b/i.test(line) ||
+    /[←→].*\bSubmit\b.*[←→]|✔\s*Submit/i.test(line) ||  // the stage bar / Submit affordance (not any "submit" in prose)
     MENU_HINT.test(line) ||
     /^[●○]/.test(line) ||
     /[▛▜▝▘▗▖█]/.test(line) ||                          // welcome/banner ASCII art
