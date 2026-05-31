@@ -101,6 +101,10 @@ class PtyProcess extends EventEmitter {
     return this.write('\r');
   }
 
+  sendSpace() {
+    return this.write(' ');
+  }
+
   resize(cols, rows) {
     if (this.proc) this.proc.resize(cols, rows);
     if (this.vt) this.vt.resize(cols, rows);

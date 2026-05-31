@@ -291,9 +291,24 @@ class SemanticSession extends EventEmitter {
     if (control === '\r') { this.agent.sendEnter(); setTimeout(commit, 150); return; }
     if (control === '\x1b') { this.agent.sendEscape(); setTimeout(commit, 150); return; }
 
+    const live = parseInteractiveState(this.agent.vt);
+
+    // Multi-select (checkbox): reply may name several options ("1 3", "1,3").
+    // Toggle each requested row with Space, then submit with Enter.
+    if (live.type === 'multi_select' && live.options.length) {
+      const nums = String(text).trim().match(/\d+/g) || [];
+      const targets = [...new Set(nums.map(n => parseInt(n, 10) - 1))]
+        .filter(i => i >= 0 && i < live.options.length);
+      if (targets.length) {
+        this._log(`Interactive multi-select: toggle rows ${targets.map(i => i + 1).join(',')} of ${live.options.length}`);
+        this._toggleAndSubmit(targets, commit);
+        return;
+      }
+      this._log(`Interactive multi-select: no valid rows in "${text}"`);
+    }
+
     const numMatch = String(text).trim().match(/^(\d+)$/);
     if (numMatch) {
-      const live = parseInteractiveState(this.agent.vt);
       if (live.type === 'select' && live.options.length) {
         const target = parseInt(numMatch[1], 10) - 1;
         if (target >= 0 && target < live.options.length) {
@@ -335,6 +350,48 @@ class SemanticSession extends EventEmitter {
       setTimeout(stepOnce, 250);   // give ConPTY time to render the moved cursor
     };
     setTimeout(stepOnce, 200);     // let the menu settle before the first read
+  }
+
+  // Multi-select: for each target row, move the cursor there (verified step loop)
+  // and press Space to toggle it ON — but only if the live screen shows it not
+  // already checked, so a re-issued reply is idempotent. After all targets are
+  // toggled, press Enter to submit. Each phase re-reads the screen so cursor and
+  // checkbox state stay in sync (ConPTY render lag safe).
+  _toggleAndSubmit(targets, onDone) {
+    const queue = [...targets];
+    const stepToRow = (to, after) => {
+      let steps = 0;
+      const tick = () => {
+        if (!this.agent.alive) { after(); return; }
+        const live = parseInteractiveState(this.agent.vt);
+        const cur = live.selected == null ? 0 : live.selected;
+        if (cur === to || steps >= 24) { after(live); return; }
+        if (to > cur) this.agent.sendArrowDown(); else this.agent.sendArrowUp();
+        steps++;
+        setTimeout(tick, 250);
+      };
+      setTimeout(tick, 200);
+    };
+    const nextTarget = () => {
+      if (!queue.length) {
+        this._log('Interactive multi-select: submitting');
+        this.agent.sendEnter();
+        if (onDone) setTimeout(onDone, 150);
+        return;
+      }
+      const to = queue.shift();
+      stepToRow(to, (live) => {
+        const alreadyChecked = live && Array.isArray(live.checked) && live.checked[to] === true;
+        if (!alreadyChecked) {
+          this._log(`Interactive multi-select: toggle row ${to + 1}`);
+          this.agent.sendSpace();
+        } else {
+          this._log(`Interactive multi-select: row ${to + 1} already checked, skip`);
+        }
+        setTimeout(nextTarget, 250);
+      });
+    };
+    nextTarget();
   }
 
   _drainQueue() {

@@ -75,14 +75,21 @@ function rowLabel(line) {
 // CLI's selection menus (/model, trust, permission, AskUserQuestion). We collect
 // ONLY numbered rows so description/footer prose interleaved in the menu is not
 // mistaken for options.
+// Checkbox glyphs Claude Code uses for multi-select rows, in checked / unchecked
+// forms. Detected per-row so we know which items are already toggled on.
+const CHECKED_RE = /[☑☒◉]|\[[xX]\]/;
+const UNCHECKED_RE = /[☐◯]|\[\s\]/;
+
 function parseNumberedMenu(spacedTail) {
   const rows = [];
   for (let i = 0; i < spacedTail.length; i++) {
-    const m = spacedTail[i].match(/^[❯>→\s]*?(\d+)[.)、]\s+(.+)$/);
+    const m = spacedTail[i].match(/^[❯>→○●◉◯☐☑☒✔✓\s]*?(\d+)[.)、]\s+(.+)$/);
     if (!m) continue;
     const label = m[2];
     if (OPTION_NOISE.test(label.trim())) continue;
-    rows.push({ i, num: parseInt(m[1], 10), label, cursor: /^[❯>→]/.test(spacedTail[i].trim()) });
+    const full = spacedTail[i];
+    const checked = CHECKED_RE.test(full) ? true : (UNCHECKED_RE.test(full) ? false : null);
+    rows.push({ i, num: parseInt(m[1], 10), label, cursor: /^[❯>→]/.test(spacedTail[i].trim()), checked });
   }
   if (rows.length < 1) return null;
   // Keep the trailing contiguous run by ascending number (1,2,3…) so a stray
@@ -95,8 +102,12 @@ function parseNumberedMenu(spacedTail) {
   const block = rows.slice(start, end + 1);
   let selected = block.findIndex(r => r.cursor);
   const shorts = block.map(r => (r.label.split(/\s{2,}/)[0] || '').replace(/\s*[✔✓☑]\s*$/, '').trim());
+  // A menu is multi-select if any row carries a checkbox glyph.
+  const hasCheckboxes = block.some(r => r.checked !== null);
   return {
     options: block.map(r => cleanOptionLabel(r.label, shorts)),
+    checked: block.map(r => r.checked === true),
+    hasCheckboxes,
     selected: selected === -1 ? null : selected,
     firstLine: block[0].i,
   };
@@ -107,8 +118,11 @@ function parseNumberedMenu(spacedTail) {
 // model …"). Prefer the short label, but if it would collide with a sibling
 // (e.g. three "claude-opus-4-8" rows), append the description to disambiguate.
 function cleanOptionLabel(label, siblingsShort) {
-  const parts = label.split(/\s{2,}/).map(p => p.trim()).filter(Boolean);
-  let short = (parts[0] || label.trim()).replace(/\s*[✔✓☑]\s*$/, '').trim();
+  // Strip a leading checkbox/radio glyph that sits after the number ("1. ☐ Foo",
+  // "2. [x] Bar") so the label is just the text.
+  const stripped = label.replace(/^\s*(?:[☐☑☒◉◯○●]|\[[ xX]\])\s*/, '');
+  const parts = stripped.split(/\s{2,}/).map(p => p.trim()).filter(Boolean);
+  let short = (parts[0] || stripped.trim()).replace(/\s*[✔✓☑]\s*$/, '').trim();
   const desc = parts.slice(1).join(' — ').replace(/\s*[✔✓☑]\s*/g, '').trim();
   if (desc && siblingsShort && siblingsShort.filter(s => s === short).length > 1) {
     return `${short} — ${desc}`.slice(0, 90);
@@ -150,7 +164,12 @@ function parseInteractiveState(vt) {
   if (numbered) {
     state.options = numbered.options;
     state.selected = numbered.selected;
+    state.checked = numbered.checked;
     menuFirstLine = numbered.firstLine;
+    // Multi-select if rows carry checkbox glyphs, or the footer mentions Space
+    // toggling (Claude Code's multi-select hint). Otherwise it's single-select.
+    const multiHint = /\bspace\b/i.test(tailText) && /\b(select|toggle|多选|选择)\b/i.test(tailText);
+    if (numbered.hasCheckboxes || multiHint) state.type = 'multi_select';
   } else {
     menuFirstLine = collectCursorMenu(tail, state);
   }
@@ -234,7 +253,8 @@ function formatInteractivePrompt(state, response) {
   // on-screen menu, which we re-render cleanly below — prepending it would show
   // the menu twice (and the raw copy drops the cursor row / mangles numbering).
   // Only prepend the response for text-input/unknown, where it carries context.
-  const isMenu = state.type === 'select' || state.type === 'permission' || state.type === 'confirm';
+  const isMenu = state.type === 'select' || state.type === 'multi_select' ||
+    state.type === 'permission' || state.type === 'confirm';
   if (response && !isMenu) parts.push(response);
 
   if (state.prompt && (!response || isMenu || !response.includes(state.prompt))) {
@@ -246,6 +266,13 @@ function formatInteractivePrompt(state, response) {
     parts.push('回复 “确认/yes” 允许，“取消/no” 拒绝');
   } else if (state.type === 'confirm') {
     parts.push('回复 “确认/yes” 继续，“取消/no” 取消');
+  } else if (state.type === 'multi_select' && state.options.length) {
+    const checked = state.checked || [];
+    state.options.forEach((option, index) => {
+      const box = checked[index] ? '☑' : '☐';
+      parts.push(`${box} ${index + 1}. ${option}`);
+    });
+    parts.push('—— 多选：回复要勾选的序号，可多个（如 `1 3`）；回复 “提交/ok” 确认，“取消” 放弃');
   } else if (state.type === 'select' && state.options.length) {
     state.options.forEach((option, index) => {
       const marker = state.selected === index ? ' ❮ 当前' : '';

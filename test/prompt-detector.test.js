@@ -54,6 +54,27 @@ const MODEL_MENU = [
   '  Enter to set as default · s to use this session only · Esc to cancel',
 ].join('\n');
 
+// Multi-select (checkbox) menu, ◯/◉ glyph style with a Space-toggle footer.
+// Rows 2 and 4 are checked; cursor on row 1.
+const MULTI_CIRCLE = [
+  'Which features to enable?',
+  '❯ 1. ◯ Logging',
+  '  2. ◉ Caching',
+  '  3. ◯ Monitoring',
+  '  4. ◉ Alerting',
+  '  Space to select · Enter to submit · Esc to cancel',
+].join('\n');
+
+// Multi-select, [ ]/[x] bracket glyph style. Only row 3 checked; cursor row 3.
+const MULTI_BRACKET = [
+  'Pick modules to refactor',
+  '  1. [ ] parser',
+  '  2. [ ] state machine',
+  '❯ 3. [x] adapter',
+  '  4. [ ] persistence',
+  '  space toggle · enter submit',
+].join('\n');
+
 // The main input box with text already typed into it — the exact regression:
 // after a reply, the gateway writes "/context" into the box BEFORE pressing
 // Enter, so the screen briefly shows "❯ /context". This must read as idle, not
@@ -86,7 +107,7 @@ const IDLE_V2 = `⏺ Done.\n\n────────────────�
 // ---- detectScreenType ----
 (async () => {
 const S = {};
-for (const [k, v] of Object.entries({ IDLE, IDLE_V2, INPUT_TYPED, PROCESSING, NUMBERED_MENU, RADIO_MENU, MODEL_MENU, TEXT_INPUT, PERMISSION, PROSE_TRUST, PROSE_PERMISSION, PROSE_NUMBERED, TRUST })) {
+for (const [k, v] of Object.entries({ IDLE, IDLE_V2, INPUT_TYPED, PROCESSING, NUMBERED_MENU, RADIO_MENU, MODEL_MENU, MULTI_CIRCLE, MULTI_BRACKET, TEXT_INPUT, PERMISSION, PROSE_TRUST, PROSE_PERMISSION, PROSE_NUMBERED, TRUST })) {
   S[k] = await screen(v);
 }
 
@@ -134,6 +155,23 @@ check('model: selected=3 (cursor row)', model.selected === 3, String(model.selec
 check('model: label 1 trimmed', model.options[0] === 'Default (recommended)', JSON.stringify(model.options[0]));
 check('model: dup shorts disambiguated', model.options[1] !== model.options[2], `${model.options[1]} / ${model.options[2]}`);
 check('model: no footer in options', !model.options.some(o => /Esc to cancel|set as default/i.test(o)), JSON.stringify(model.options));
+
+const mc = parseInteractiveState(S.MULTI_CIRCLE.vt);
+check('multi(circle): type multi_select', mc.type === 'multi_select', mc.type);
+check('multi(circle): 4 options', mc.options.length === 4, JSON.stringify(mc.options));
+check('multi(circle): labels clean', mc.options[0] === 'Logging' && mc.options[1] === 'Caching', JSON.stringify(mc.options));
+check('multi(circle): checked [f,t,f,t]', JSON.stringify(mc.checked) === JSON.stringify([false,true,false,true]), JSON.stringify(mc.checked));
+check('multi(circle): cursor row 0', mc.selected === 0, String(mc.selected));
+
+const mb = parseInteractiveState(S.MULTI_BRACKET.vt);
+check('multi(bracket): type multi_select', mb.type === 'multi_select', mb.type);
+check('multi(bracket): 4 options', mb.options.length === 4, JSON.stringify(mb.options));
+check('multi(bracket): labels clean', mb.options[0] === 'parser' && mb.options[2] === 'adapter', JSON.stringify(mb.options));
+check('multi(bracket): checked [f,f,t,f]', JSON.stringify(mb.checked) === JSON.stringify([false,false,true,false]), JSON.stringify(mb.checked));
+
+const mcFmt = formatInteractivePrompt(mc, null);
+check('multi: format has checkboxes', /☐ 1\. Logging/.test(mcFmt) && /☑ 2\. Caching/.test(mcFmt), mcFmt);
+check('multi: format has multi hint', /多选/.test(mcFmt), mcFmt);
 
 const textInput = parseInteractiveState(S.TEXT_INPUT.vt);
 check('text input: type text_input', textInput.type === 'text_input', textInput.type);
