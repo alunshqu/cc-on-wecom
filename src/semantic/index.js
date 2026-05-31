@@ -342,11 +342,30 @@ class SemanticSession extends EventEmitter {
       const map = live._fullToReal || live.options.map((_, i) => i);  // displayed->full
       const nums = (String(text).trim().match(/\d+/g) || []).map(n => parseInt(n, 10));
       if (!nums.length) {
+        // Free text on a multi-select = a custom answer → route to "Type something"
+        // if present; otherwise ask for numbers.
+        if ((live.optionKinds || []).includes('type')) {
+          return this._answerWithFreeText(live, text, commit, onComplete);
+        }
         return this._rejectInteractiveReply(`没看懂「${text}」。请回复要勾选的序号（1-${optCount}），可多个，例如 1 3；或回复 “取消” 放弃。`, onComplete);
       }
       const bad = nums.filter(n => n < 1 || n > optCount);
       if (bad.length) {
         return this._rejectInteractiveReply(`序号 ${bad.join('、')} 超出范围（本题只有 1-${optCount}）。请重新回复要勾选的序号，例如 1 3。`, onComplete);
+      }
+      // If the user picked the Type/Chat special rows by number, route them
+      // specially (they are not Space-toggle checkbox items).
+      const kinds = live.optionKinds || [];
+      const special = nums.map(n => n - 1).find(di => kinds[di] === 'type' || kinds[di] === 'chat');
+      if (special != null) {
+        if (kinds[special] === 'type') {
+          return this._rejectInteractiveReply('要自己输入的话，直接把内容回复给我就行（不用回序号）。', onComplete);
+        }
+        // chat: navigate to it and Enter (leaves the menu, switches to chat).
+        const from = live.selected == null ? 0 : live.selected;
+        this._log(`Interactive multi-select: chat row ${special + 1}`);
+        this._navigateAndConfirm(from, special, commit);
+        return;
       }
       const dispTargets = [...new Set(nums.map(n => n - 1))];
       const fullTargets = dispTargets.map(i => map[i]);
@@ -356,28 +375,77 @@ class SemanticSession extends EventEmitter {
     }
 
     // Single-select / confirm: Enter (确认/ok) confirms the current row.
-    if (control === '\r') { this.agent.sendEnter(); setTimeout(commit, 150); return; }
+    if (control === '\r' && live.type !== 'select') { this.agent.sendEnter(); setTimeout(commit, 150); return; }
 
     const numMatch = String(text).trim().match(/^(\d+)$/);
+
     if (live.type === 'select' && optCount) {
-      if (!numMatch) {
-        return this._rejectInteractiveReply(`请回复一个序号（1-${optCount}）来选择，例如 1。`, onComplete);
+      // Free text (not a number) = "answer outside the listed options" → route to
+      // the menu's "Type something" row if it has one; otherwise reject.
+      if (!numMatch && control !== '\r') {
+        return this._answerWithFreeText(live, text, commit, onComplete);
       }
+      if (control === '\r') { this.agent.sendEnter(); setTimeout(commit, 150); return; }
       const n = parseInt(numMatch[1], 10);
       if (n < 1 || n > optCount) {
         return this._rejectInteractiveReply(`序号 ${n} 超出范围（本题只有 1-${optCount}）。请回复 1-${optCount} 之间的序号。`, onComplete);
       }
-      const target = n - 1;
+      const di = n - 1;
+      const kind = (live.optionKinds || [])[di] || 'choice';
       const from = live.selected == null ? 0 : live.selected;
-      this._log(`Interactive select: ${n} (from ${from} to ${target} of ${optCount})`);
-      this._navigateAndConfirm(from, target, commit);
+      if (kind === 'type') {
+        // Selecting the "Type something" row but with no text to enter — ask for it.
+        return this._rejectInteractiveReply('要自己输入的话，直接把内容回复给我就行（不用回序号）。', onComplete);
+      }
+      this._log(`Interactive select: ${n} (kind=${kind}, from ${from} to ${di} of ${optCount})`);
+      this._navigateAndConfirm(from, di, commit);   // 'chat' also just navigates+Enter
       return;
     }
 
-    // Free-text reply into a text-input prompt.
+    // No menu (plain text_input prompt): deliver the text directly.
     const sanitized = String(text).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
     this.agent.write(sanitized);
     setTimeout(() => { if (this.agent.alive) this.agent.sendEnter(); setTimeout(commit, 150); }, 100);
+  }
+
+  // Provide a free-text answer to a menu by selecting its "Type something" row,
+  // then typing the text and Enter. If the menu has no such row, reject with
+  // guidance (we won't blindly type into a plain selection menu).
+  _answerWithFreeText(live, text, commit, onComplete) {
+    const kinds = live.optionKinds || [];
+    const di = kinds.indexOf('type');
+    if (di === -1) {
+      const n = live.options ? live.options.length : 0;
+      return this._rejectInteractiveReply(`这道题只能选序号（1-${n}）。请回复一个序号，例如 1。`, onComplete);
+    }
+    const from = live.selected == null ? 0 : live.selected;
+    this._log(`Interactive free-text: select "Type something" (row ${di}), then type ${text.length} chars`);
+    // Navigate to the Type row and Enter to open the input, then type + Enter.
+    this._navigateToRow(from, di, () => {
+      this.agent.sendEnter();   // open the free-text input
+      setTimeout(() => {
+        if (!this.agent.alive) { commit(); return; }
+        const sanitized = String(text).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
+        this.agent.write(sanitized);
+        setTimeout(() => { if (this.agent.alive) this.agent.sendEnter(); setTimeout(commit, 150); }, 150);
+      }, 300);
+    });
+  }
+
+  // Move the menu cursor to displayed row `to` (verified step loop), then call
+  // done() — without pressing Enter (caller decides what to do on arrival).
+  _navigateToRow(from, to, done) {
+    let steps = 0;
+    const stepOnce = () => {
+      if (!this.agent.alive) { done(); return; }
+      const live = parseInteractiveState(this.agent.vt);
+      const cur = live.selected == null ? from : live.selected;
+      if (cur === to || steps >= 30) { done(); return; }
+      if (to > cur) this.agent.sendArrowDown(); else this.agent.sendArrowUp();
+      steps++;
+      setTimeout(stepOnce, 250);
+    };
+    setTimeout(stepOnce, 200);
   }
 
   // Reject an invalid interactive reply WITHOUT touching the menu: stay in

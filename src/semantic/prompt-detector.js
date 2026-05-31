@@ -115,9 +115,8 @@ function parseNumberedMenu(spacedTail) {
   };
 }
 
-// AskUserQuestion appends non-choice affordance rows ("Type something" for free
-// text, "Chat about this", and a "Submit" action). They are not real options.
-const AFFORDANCE_RE = /^(Submit|Type something\.?|Chat about this|输入|提交)$/i;
+// (Submit/Next/Type/Chat affordance rows are classified inline in
+// parseInteractiveState; no shared regex needed here.)
 
 // The raw text of the line the menu cursor (❯) is currently on, with box borders
 // stripped. Used to drive multi-select submit: the "Submit" row is not numbered,
@@ -207,25 +206,36 @@ function parseInteractiveState(vt) {
   const numbered = parseNumberedMenu(spacedTail);
   let menuFirstLine = -1;
   if (numbered) {
-    // Drop affordance rows ("Submit", "Type something", "Chat about this") from
-    // the user-facing options, but remember the Submit row's position (in full
-    // block coordinates) so a multi-select can be committed by navigating to it.
-    // We keep option/selected/checked in FULL coordinates (what the arrow keys
-    // operate on) and expose the affordance-filtered view separately.
+    // AskUserQuestion menus end with special rows. Classify each row:
+    //   - "Submit" / "Next"        → commit action; not a user choice, filtered
+    //                                 out but remembered as the submit row.
+    //   - "Type something[.]"      → free-text entry; shown as a choice (the user
+    //                                 can pick it, or just reply free text).
+    //   - "Chat about this"        → leave the menu and chat; shown as a choice.
+    //   - everything else          → a real choice.
+    // Navigation uses FULL block indices, so we map displayed numbers back.
     const full = numbered.options;
     let submitIndex = -1;
     const keep = [];
+    const kinds = [];                          // role of each displayed option
     full.forEach((label, i) => {
-      if (/^submit$/i.test(label.trim())) { if (submitIndex === -1) submitIndex = i; return; }
-      if (AFFORDANCE_RE.test(label.trim())) return;
+      const t = label.trim();
+      if (/^(Submit|Next)$/i.test(t)) { if (submitIndex === -1) submitIndex = i; return; }
       keep.push(i);
+      if (/^Type something\.?$/i.test(t)) kinds.push('type');
+      else if (/^Chat about this$/i.test(t)) kinds.push('chat');
+      else kinds.push('choice');
     });
-    // Display only real choices, but navigation still uses full-block indices, so
-    // map displayed numbers back to full indices.
-    state.options = keep.map(i => full[i]);
+    state.options = keep.map((i, di) => {
+      // Friendlier labels for the two special rows.
+      if (kinds[di] === 'type') return '✍️ 自己输入';
+      if (kinds[di] === 'chat') return '💬 就这个问题聊聊';
+      return full[i];
+    });
     state.checked = keep.map(i => numbered.checked[i]);
+    state.optionKinds = kinds;                 // 'choice' | 'type' | 'chat'
     state._fullToReal = keep;                  // displayed idx -> full row idx
-    state._submitRow = submitIndex;            // full row idx of "Submit", or -1
+    state._submitRow = submitIndex;            // full row idx of "Submit"/"Next", or -1
     state._fullChecked = numbered.checked;     // full-coords checkbox state
     state.selected = numbered.selected != null ? keep.indexOf(numbered.selected) : null;
     if (state.selected === -1) state.selected = null;
@@ -348,11 +358,15 @@ function formatInteractivePrompt(state, response) {
     parts.push('回复 “确认/yes” 继续，“取消/no” 取消');
   } else if (state.type === 'multi_select' && state.options.length) {
     const checked = state.checked || [];
+    const kinds = state.optionKinds || [];
     state.options.forEach((option, index) => {
-      const box = checked[index] ? '☑' : '☐';
-      parts.push(`${box} ${index + 1}. ${option}`);
+      // Type/chat rows aren't toggle items — show them without a checkbox.
+      const box = (kinds[index] === 'choice' || kinds[index] === undefined)
+        ? (checked[index] ? '☑' : '☐') + ' '
+        : '';
+      parts.push(`${box}${index + 1}. ${option}`);
     });
-    parts.push('—— 多选：回复要勾选的序号即可（可多个，如 `1 3`），我会自动提交；回复 “取消” 放弃');
+    parts.push('—— 多选：回复要勾选的序号（可多个，如 `1 3`），我会自动提交；直接回复文字＝自己输入；回复 “取消” 放弃');
   } else if (state.type === 'select' && state.options.length) {
     state.options.forEach((option, index) => {
       const marker = state.selected === index ? ' ❮ 当前' : '';
