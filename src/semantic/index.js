@@ -174,12 +174,17 @@ class SemanticSession extends EventEmitter {
     const prev = this.phase;
     this.phase = AgentState.AWAITING_INPUT;
     this.status = 'idle';
-    this._log('Claude is waiting for interactive input');
 
     const response = extractResponse(this.agent.vt, this.currentRequest?.text);
     const interactiveState = parseInteractiveState(this.agent.vt);
     const message = formatInteractivePrompt(interactiveState, response);
     this.interactiveState = interactiveState;
+
+    // Observability: log how we parsed the prompt AND the raw screen tail, so a
+    // misread (wrong type / missing options / bad checkbox state) is diagnosable
+    // straight from the log — no need to ask the user to screenshot the menu.
+    this._log(`Claude is waiting for interactive input — parsed: ${this._describeInteractive(interactiveState)}`);
+    this._logScreenTail('interactive');
 
     if (response && response !== this.lastExtractedResponse) {
       this.lastExtractedResponse = response;
@@ -190,6 +195,31 @@ class SemanticSession extends EventEmitter {
     this.currentRequest = null;
     this.emit('state-change', { from: prev, to: AgentState.AWAITING_INPUT });
     this.emit('interactive-prompt', { state: interactiveState, response, message });
+  }
+
+  // Compact one-line summary of a parsed interactive state for the log.
+  _describeInteractive(st) {
+    if (!st) return 'none';
+    const opts = (st.options || []).map((o, i) => {
+      const ck = st.type === 'multi_select' ? (st.checked && st.checked[i] ? '☑' : '☐') : '';
+      const cur = st.selected === i ? '❮' : '';
+      return `${i + 1}.${ck}${cur}${o}`;
+    }).join(' | ');
+    return `type=${st.type} prompt="${st.prompt || ''}" selected=${st.selected} [${opts}]`;
+  }
+
+  // Log the raw screen tail (box borders stripped) as a single escaped line, so
+  // when the parser is wrong the ground-truth render is right there in the log.
+  _logScreenTail(tag, lines = 16) {
+    try {
+      const tail = this.agent.getScreenLines()
+        .map(l => l.replace(/[╭╰╮╯│─━╌┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬]/g, ' ').replace(/\s+$/, ''))
+        .filter(l => l.trim())
+        .slice(-lines);
+      this._log(`screen[${tag}]: ${tail.map(l => l.replace(/\s+/g, ' ').trim()).join(' ⏎ ')}`);
+    } catch (e) {
+      this._log(`screen[${tag}]: <unavailable: ${e.message}>`);
+    }
   }
 
   _finishResponse(reason) {
@@ -213,7 +243,10 @@ class SemanticSession extends EventEmitter {
       }
       this._invokeCallbacks(response);
     } else {
+      // Dump the raw screen so a failed extraction is diagnosable from the log
+      // rather than needing a screenshot.
       this._log('No response extracted');
+      this._logScreenTail('no-response');
       this._invokeCallbacks(null);
     }
 
