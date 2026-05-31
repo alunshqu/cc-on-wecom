@@ -320,47 +320,85 @@ class SemanticSession extends EventEmitter {
       this.stateMachine.tick();
     };
 
+    const live = parseInteractiveState(this.agent.vt);
+    const optCount = live.options ? live.options.length : 0;
     const control = normalizeInteractiveInput(text);
-    if (control === '\r') { this.agent.sendEnter(); setTimeout(commit, 150); return; }
+
+    // Cancel maps to Escape on any prompt type.
     if (control === '\x1b') { this.agent.sendEscape(); setTimeout(commit, 150); return; }
 
-    const live = parseInteractiveState(this.agent.vt);
-
     // Multi-select (checkbox): reply may name several options ("1 3", "1,3").
-    // Toggle each requested item with Space, then move to the Submit row and
-    // Enter — the user never has to type "提交" themselves.
-    if (live.type === 'multi_select' && live.options.length) {
-      const map = live._fullToReal || live.options.map((_, i) => i);  // displayed->full
-      const nums = String(text).trim().match(/\d+/g) || [];
-      const dispTargets = [...new Set(nums.map(n => parseInt(n, 10) - 1))]
-        .filter(i => i >= 0 && i < live.options.length);
-      if (dispTargets.length) {
-        const fullTargets = dispTargets.map(i => map[i]);
-        this._log(`Interactive multi-select: toggle displayed ${dispTargets.map(i => i + 1).join(',')} -> full rows ${fullTargets.join(',')}; submitRow=${live._submitRow}`);
-        this._toggleAndSubmit(fullTargets, live._submitRow, commit);
+    // Validate the whole set first — if ANY number is out of range, reject the
+    // reply with a clear message and re-show the menu, rather than silently
+    // applying only the valid ones (the user wouldn't know what took effect).
+    if (live.type === 'multi_select' && optCount) {
+      // "提交/ok/确认" with nothing to toggle: go straight to the Submit stage.
+      // (A bare Enter here would only toggle the current row, not submit.)
+      if (control === '\r') {
+        this._log('Interactive multi-select: explicit submit, no toggles');
+        this._toggleAndSubmit([], live._submitRow, commit);
         return;
       }
-      this._log(`Interactive multi-select: no valid rows in "${text}"`);
+      const map = live._fullToReal || live.options.map((_, i) => i);  // displayed->full
+      const nums = (String(text).trim().match(/\d+/g) || []).map(n => parseInt(n, 10));
+      if (!nums.length) {
+        return this._rejectInteractiveReply(`没看懂「${text}」。请回复要勾选的序号（1-${optCount}），可多个，例如 1 3；或回复 “取消” 放弃。`, onComplete);
+      }
+      const bad = nums.filter(n => n < 1 || n > optCount);
+      if (bad.length) {
+        return this._rejectInteractiveReply(`序号 ${bad.join('、')} 超出范围（本题只有 1-${optCount}）。请重新回复要勾选的序号，例如 1 3。`, onComplete);
+      }
+      const dispTargets = [...new Set(nums.map(n => n - 1))];
+      const fullTargets = dispTargets.map(i => map[i]);
+      this._log(`Interactive multi-select: toggle displayed ${dispTargets.map(i => i + 1).join(',')} -> full rows ${fullTargets.join(',')}; submitRow=${live._submitRow}`);
+      this._toggleAndSubmit(fullTargets, live._submitRow, commit);
+      return;
     }
 
+    // Single-select / confirm: Enter (确认/ok) confirms the current row.
+    if (control === '\r') { this.agent.sendEnter(); setTimeout(commit, 150); return; }
+
     const numMatch = String(text).trim().match(/^(\d+)$/);
-    if (numMatch) {
-      if (live.type === 'select' && live.options.length) {
-        const target = parseInt(numMatch[1], 10) - 1;
-        if (target >= 0 && target < live.options.length) {
-          const from = live.selected == null ? 0 : live.selected;
-          this._log(`Interactive select: ${numMatch[1]} (from ${from} to ${target} of ${live.options.length})`);
-          this._navigateAndConfirm(from, target, commit);
-          return;
-        }
-        this._log(`Interactive select out of range: ${numMatch[1]} (have ${live.options.length})`);
+    if (live.type === 'select' && optCount) {
+      if (!numMatch) {
+        return this._rejectInteractiveReply(`请回复一个序号（1-${optCount}）来选择，例如 1。`, onComplete);
       }
+      const n = parseInt(numMatch[1], 10);
+      if (n < 1 || n > optCount) {
+        return this._rejectInteractiveReply(`序号 ${n} 超出范围（本题只有 1-${optCount}）。请回复 1-${optCount} 之间的序号。`, onComplete);
+      }
+      const target = n - 1;
+      const from = live.selected == null ? 0 : live.selected;
+      this._log(`Interactive select: ${n} (from ${from} to ${target} of ${optCount})`);
+      this._navigateAndConfirm(from, target, commit);
+      return;
     }
 
     // Free-text reply into a text-input prompt.
     const sanitized = String(text).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
     this.agent.write(sanitized);
     setTimeout(() => { if (this.agent.alive) this.agent.sendEnter(); setTimeout(commit, 150); }, 100);
+  }
+
+  // Reject an invalid interactive reply WITHOUT touching the menu: stay in
+  // AWAITING_INPUT, undo the SENT_MSG-style setup done by _sendInteractiveReply,
+  // tell the user what was wrong, and re-show the current prompt so they can
+  // retry. Prevents silently typing bad input into the menu (the old fall-through
+  // typed "5" as literal text and pressed Enter — unpredictable, no feedback).
+  _rejectInteractiveReply(reasonMsg, onComplete) {
+    this._interactiveBusy = false;
+    this._log(`Interactive reply rejected: ${reasonMsg}`);
+    // Drop the pending callback we queued for this reply (the turn isn't ending).
+    if (onComplete) {
+      const idx = this.pendingCallbacks.findIndex(c => c.cb === onComplete);
+      if (idx !== -1) this.pendingCallbacks.splice(idx, 1);
+    }
+    const menu = this.interactiveState
+      ? formatInteractivePrompt(this.interactiveState, null)
+      : '';
+    const message = menu ? `⚠️ ${reasonMsg}\n\n${menu}` : `⚠️ ${reasonMsg}`;
+    // Deliver via the same interactive-prompt channel the adapter already shows.
+    this.emit('interactive-prompt', { state: this.interactiveState, response: null, message });
   }
 
   // Move the menu cursor to `to` by sending one arrow key at a time and
