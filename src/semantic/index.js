@@ -4,7 +4,7 @@ const { AgentState } = require('./event-types');
 const { ClaudeAgent } = require('../cli-agent');
 const StateMachine = require('./state-machine');
 const { extractResponse } = require('./response-extractor');
-const { parseInteractiveState, formatInteractivePrompt, normalizeInteractiveInput, cursorLineText } = require('./prompt-detector');
+const { parseInteractiveState, formatInteractivePrompt, normalizeInteractiveInput } = require('./prompt-detector');
 const { homedir } = require('../shared/platform');
 const { log: defaultLog } = require('../shared/logger');
 
@@ -421,32 +421,43 @@ class SemanticSession extends EventEmitter {
       setTimeout(tick, 200);
     };
 
-    // Submit by arrowing DOWN until the cursor lands on the "Submit" line (it is
-    // not a numbered row, so we detect it by the live cursor's text), then Enter.
-    // Enter on this widget toggles the current option, so we must be ON Submit.
-    // Bounded; if Submit is never reached, fall back to a final Enter.
+    // Submit a multi-select. Multi-step prompts have a top stage bar
+    // (← stage1 … Submit →) navigated with ←/→; the last stage is Submit and
+    // Enter there commits. Press → until we're on the Submit stage, then Enter.
+    // Detecting "on Submit": the checkbox option list disappears (no multi_select
+    // options parsed) while the stage bar is still present — the Submit stage has
+    // no question. Also accept an explicit current==submit stage match.
     const submit = () => {
       let steps = 0;
       const tick = () => {
         if (!this.agent.alive) { if (onDone) onDone(); return; }
-        const cur = cursorLineText(this.agent.vt);
-        if (/^(submit|提交)\b/i.test(cur) || /^(submit|提交)$/i.test(cur.trim())) {
-          this._log(`Interactive multi-select: on Submit ("${cur}"), pressing Enter`);
+        const st = parseInteractiveState(this.agent.vt);
+        if (!st.stageBar) {
+          this._log('Interactive multi-select: no stage bar, Enter to submit');
+          this.agent.sendEnter();
+          if (onDone) setTimeout(onDone, 150);
+          return;
+        }
+        const onSubmitByIndex = st.currentStageIndex >= 0 && st.currentStageIndex === st.submitStageIndex;
+        const onSubmitByEmpty = st.type !== 'multi_select' || !st.options || st.options.length === 0;
+        if (steps > 0 && (onSubmitByIndex || onSubmitByEmpty)) {
+          this._log(`Interactive multi-select: on Submit stage (idx=${st.currentStageIndex}/${st.submitStageIndex}, opts=${st.options ? st.options.length : 0}), Enter`);
           this.agent.sendEnter();
           if (onDone) setTimeout(onDone, 150);
           return;
         }
         if (steps >= 12) {
-          this._log(`Interactive multi-select: Submit not found (cursor="${cur}"), Enter fallback`);
+          this._log(`Interactive multi-select: could not reach Submit (idx=${st.currentStageIndex}/${st.submitStageIndex}), Enter fallback`);
           this.agent.sendEnter();
           if (onDone) setTimeout(onDone, 150);
           return;
         }
-        this.agent.sendArrowDown();
+        this._log(`Interactive multi-select: → toward Submit (stage ${st.currentStageIndex}/${st.submitStageIndex})`);
+        this.agent.sendArrowRight();
         steps++;
-        setTimeout(tick, 250);
+        setTimeout(tick, 280);
       };
-      setTimeout(tick, 200);
+      setTimeout(tick, 250);
     };
 
     const nextTarget = () => {

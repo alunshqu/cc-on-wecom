@@ -151,6 +151,30 @@ function cleanOptionLabel(label, siblingsShort) {
   return (short || label.trim()).slice(0, 90);
 }
 
+// Multi-step prompts show a stage bar at the top, navigated with ←/→:
+//   "← ☒ 主题 ☒ 字号 ☐ 快捷键 ✔ Submit →"
+// Each stage has a glyph (☒/☑ done, ☐ pending, ✔ on Submit) and a label; the
+// last stage is "Submit". Returns { stages:[{glyph,label}], submitIndex } or null.
+// We use this to commit a multi-select: press → until on Submit, then Enter.
+function parseStageBar(tailLines) {
+  for (const raw of tailLines) {
+    if (!/[←→]/.test(raw)) continue;
+    if (!/(Submit|提交)/i.test(raw)) continue;
+    const inner = raw.replace(/[←→]/g, ' ').trim();
+    const stages = [];
+    const re = /([☒☑☐✔✓])\s+([^\s☒☑☐✔✓]+(?:\s+[^\s☒☑☐✔✓]+)*?)(?=\s+[☒☑☐✔✓]|\s*$)/g;
+    let m;
+    while ((m = re.exec(inner)) !== null) {
+      stages.push({ glyph: m[1], label: m[2].trim() });
+    }
+    if (stages.length < 2) continue;
+    const submitIndex = stages.findIndex(s => /^(Submit|提交)$/i.test(s.label));
+    if (submitIndex === -1) continue;
+    return { stages, submitIndex };
+  }
+  return null;
+}
+
 function parseInteractiveState(vt) {
   const rawLines = getScreenLines(vt).filter(l => l.trim());
   const lines = rawLines.map(cleanInteractiveLine).filter(Boolean);
@@ -237,6 +261,24 @@ function parseInteractiveState(vt) {
   if (state.type === 'unknown') {
     if (state.options.length > 0) state.type = 'select';
     else if (state.prompt || state.submitAvailable || /❯\s*$/.test(tailText)) state.type = 'text_input';
+  }
+
+  // Multi-step stage bar (← stage1 stage2 … Submit →). Expose it plus the
+  // current stage index (the stage whose question is currently shown — matched
+  // by label appearing in the prompt) so a multi-select can press → to Submit.
+  const bar = parseStageBar(tail);
+  if (bar) {
+    state.stageBar = bar.stages;
+    state.submitStageIndex = bar.submitIndex;
+    let cur = -1;
+    for (let i = 0; i < bar.stages.length; i++) {
+      const lbl = bar.stages[i].label;
+      if (/^(Submit|提交)$/i.test(lbl)) continue;
+      if (state.prompt && state.prompt.includes(lbl)) { cur = i; break; }
+    }
+    // Fallback: the active stage is the last non-done one (☐) before Submit.
+    if (cur === -1) cur = bar.stages.findIndex(s => s.glyph === '☐');
+    state.currentStageIndex = cur;
   }
 
   // Do NOT dedup: numbered menus are positional, and distinct rows may share a
