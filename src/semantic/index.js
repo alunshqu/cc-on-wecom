@@ -397,8 +397,18 @@ class SemanticSession extends EventEmitter {
         // Selecting the "Type something" row but with no text to enter — ask for it.
         return this._rejectInteractiveReply('要自己输入的话，直接把内容回复给我就行（不用回序号）。', onComplete);
       }
+      if (kind === 'chat') {
+        // Chat about this: navigate there and Enter to trigger the screen to
+        // refresh into chat mode. We don't send anything else — commit() moves to
+        // PROCESSING and the state machine reads whatever the refreshed screen
+        // becomes (a reply, or a new prompt), so the next step is decided by the
+        // actual result.
+        this._log(`Interactive select: ${n} -> Chat about this (row ${di}), Enter to switch to chat`);
+        this._navigateAndConfirm(from, di, commit);
+        return;
+      }
       this._log(`Interactive select: ${n} (kind=${kind}, from ${from} to ${di} of ${optCount})`);
-      this._navigateAndConfirm(from, di, commit);   // 'chat' also just navigates+Enter
+      this._navigateAndConfirm(from, di, commit);
       return;
     }
 
@@ -408,9 +418,10 @@ class SemanticSession extends EventEmitter {
     setTimeout(() => { if (this.agent.alive) this.agent.sendEnter(); setTimeout(commit, 150); }, 100);
   }
 
-  // Provide a free-text answer to a menu by selecting its "Type something" row,
-  // then typing the text and Enter. If the menu has no such row, reject with
-  // guidance (we won't blindly type into a plain selection menu).
+  // Provide a free-text answer to a menu by navigating to its "Type something"
+  // row and typing directly — the row IS a live input, so NO Enter is needed to
+  // open it. A single Enter at the end commits the typed answer. If the menu has
+  // no such row, reject with guidance (we won't blindly type into a plain menu).
   _answerWithFreeText(live, text, commit, onComplete) {
     const kinds = live.optionKinds || [];
     const di = kinds.indexOf('type');
@@ -419,16 +430,13 @@ class SemanticSession extends EventEmitter {
       return this._rejectInteractiveReply(`这道题只能选序号（1-${n}）。请回复一个序号，例如 1。`, onComplete);
     }
     const from = live.selected == null ? 0 : live.selected;
-    this._log(`Interactive free-text: select "Type something" (row ${di}), then type ${text.length} chars`);
-    // Navigate to the Type row and Enter to open the input, then type + Enter.
+    this._log(`Interactive free-text: navigate to "Type something" (row ${di}), type ${text.length} chars directly`);
+    // Navigate to the Type row, then type directly (no Enter to "open"), Enter to submit.
     this._navigateToRow(from, di, () => {
-      this.agent.sendEnter();   // open the free-text input
-      setTimeout(() => {
-        if (!this.agent.alive) { commit(); return; }
-        const sanitized = String(text).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
-        this.agent.write(sanitized);
-        setTimeout(() => { if (this.agent.alive) this.agent.sendEnter(); setTimeout(commit, 150); }, 150);
-      }, 300);
+      if (!this.agent.alive) { commit(); return; }
+      const sanitized = String(text).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
+      this.agent.write(sanitized);
+      setTimeout(() => { if (this.agent.alive) this.agent.sendEnter(); setTimeout(commit, 150); }, 200);
     });
   }
 
