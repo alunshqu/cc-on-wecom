@@ -76,9 +76,10 @@ function rowLabel(line) {
 // ONLY numbered rows so description/footer prose interleaved in the menu is not
 // mistaken for options.
 // Checkbox glyphs Claude Code uses for multi-select rows, in checked / unchecked
-// forms. Detected per-row so we know which items are already toggled on.
-const CHECKED_RE = /[☑☒◉]|\[[xX]\]/;
-const UNCHECKED_RE = /[☐◯]|\[\s\]/;
+// forms. The CLI renders checked as [✔] (also tolerate ☑/☒/◉/[x]) and unchecked
+// as [ ] (also ☐/◯). Detected per-row so we know which items are toggled on.
+const CHECKED_RE = /[☑☒◉]|\[\s*[✔✓xX]\s*\]/;
+const UNCHECKED_RE = /[☐◯]|\[\s*\]/;
 
 function parseNumberedMenu(spacedTail) {
   const rows = [];
@@ -107,10 +108,30 @@ function parseNumberedMenu(spacedTail) {
   return {
     options: block.map(r => cleanOptionLabel(r.label, shorts)),
     checked: block.map(r => r.checked === true),
+    rowCursor: block.map(r => r.cursor),
     hasCheckboxes,
     selected: selected === -1 ? null : selected,
     firstLine: block[0].i,
   };
+}
+
+// AskUserQuestion appends non-choice affordance rows ("Type something" for free
+// text, "Chat about this", and a "Submit" action). They are not real options.
+const AFFORDANCE_RE = /^(Submit|Type something\.?|Chat about this|输入|提交)$/i;
+
+// The raw text of the line the menu cursor (❯) is currently on, with box borders
+// stripped. Used to drive multi-select submit: the "Submit" row is not numbered,
+// so we navigate by arrowing until the cursor sits on a line matching /submit/i.
+function cursorLineText(vt) {
+  const lines = getScreenLines(vt)
+    .map(l => l.replace(/[╭╰╮╯│─━╌┌┐└┘├┤┬┴┼═║╔╗╚╝╠╣╦╩╬]/g, ' ').trimEnd())
+    .filter(l => l.trim());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/^\s*[❯>→]/.test(lines[i])) {
+      return lines[i].replace(/^\s*[❯>→]\s*/, '').trim();
+    }
+  }
+  return '';
 }
 
 // Build a clean, distinct label from a menu row. The CLI pads a short label and
@@ -119,8 +140,8 @@ function parseNumberedMenu(spacedTail) {
 // (e.g. three "claude-opus-4-8" rows), append the description to disambiguate.
 function cleanOptionLabel(label, siblingsShort) {
   // Strip a leading checkbox/radio glyph that sits after the number ("1. ☐ Foo",
-  // "2. [x] Bar") so the label is just the text.
-  const stripped = label.replace(/^\s*(?:[☐☑☒◉◯○●]|\[[ xX]\])\s*/, '');
+  // "2. [x] Bar", "3. [✔] Baz") so the label is just the text.
+  const stripped = label.replace(/^\s*(?:[☐☑☒◉◯○●]|\[\s*[ xX✔✓]?\s*\])\s*/, '');
   const parts = stripped.split(/\s{2,}/).map(p => p.trim()).filter(Boolean);
   let short = (parts[0] || stripped.trim()).replace(/\s*[✔✓☑]\s*$/, '').trim();
   const desc = parts.slice(1).join(' — ').replace(/\s*[✔✓☑]\s*/g, '').trim();
@@ -162,12 +183,29 @@ function parseInteractiveState(vt) {
   const numbered = parseNumberedMenu(spacedTail);
   let menuFirstLine = -1;
   if (numbered) {
-    state.options = numbered.options;
-    state.selected = numbered.selected;
-    state.checked = numbered.checked;
+    // Drop affordance rows ("Submit", "Type something", "Chat about this") from
+    // the user-facing options, but remember the Submit row's position (in full
+    // block coordinates) so a multi-select can be committed by navigating to it.
+    // We keep option/selected/checked in FULL coordinates (what the arrow keys
+    // operate on) and expose the affordance-filtered view separately.
+    const full = numbered.options;
+    let submitIndex = -1;
+    const keep = [];
+    full.forEach((label, i) => {
+      if (/^submit$/i.test(label.trim())) { if (submitIndex === -1) submitIndex = i; return; }
+      if (AFFORDANCE_RE.test(label.trim())) return;
+      keep.push(i);
+    });
+    // Display only real choices, but navigation still uses full-block indices, so
+    // map displayed numbers back to full indices.
+    state.options = keep.map(i => full[i]);
+    state.checked = keep.map(i => numbered.checked[i]);
+    state._fullToReal = keep;                  // displayed idx -> full row idx
+    state._submitRow = submitIndex;            // full row idx of "Submit", or -1
+    state._fullChecked = numbered.checked;     // full-coords checkbox state
+    state.selected = numbered.selected != null ? keep.indexOf(numbered.selected) : null;
+    if (state.selected === -1) state.selected = null;
     menuFirstLine = numbered.firstLine;
-    // Multi-select if rows carry checkbox glyphs, or the footer mentions Space
-    // toggling (Claude Code's multi-select hint). Otherwise it's single-select.
     const multiHint = /\bspace\b/i.test(tailText) && /\b(select|toggle|多选|选择)\b/i.test(tailText);
     if (numbered.hasCheckboxes || multiHint) state.type = 'multi_select';
   } else {
@@ -272,7 +310,7 @@ function formatInteractivePrompt(state, response) {
       const box = checked[index] ? '☑' : '☐';
       parts.push(`${box} ${index + 1}. ${option}`);
     });
-    parts.push('—— 多选：回复要勾选的序号，可多个（如 `1 3`）；回复 “提交/ok” 确认，“取消” 放弃');
+    parts.push('—— 多选：回复要勾选的序号即可（可多个，如 `1 3`），我会自动提交；回复 “取消” 放弃');
   } else if (state.type === 'select' && state.options.length) {
     state.options.forEach((option, index) => {
       const marker = state.selected === index ? ' ❮ 当前' : '';
@@ -293,4 +331,4 @@ function normalizeInteractiveInput(text) {
   return null;
 }
 
-module.exports = { parseInteractiveState, formatInteractivePrompt, normalizeInteractiveInput };
+module.exports = { parseInteractiveState, formatInteractivePrompt, normalizeInteractiveInput, cursorLineText };
